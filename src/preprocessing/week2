@@ -138,3 +138,109 @@ plt.title("Raw DICOM pixel_array")
 
 # 真正把图片显示出来
 plt.show()
+
+#Ⅵ.记录图像元数据
+# 元数据包括 image ID, width, height, photometric interpretation, and pixel-value range
+
+# first_dicom_path.stem 的意思是只要文件名，不要 .dicom 后缀
+# 例如 xxx.dicom -> xxx
+image_id = first_dicom_path.stem
+
+# pixel_array.shape 表示图像矩阵的形状
+# 对灰度图来说，顺序是 height, width
+height, width = pixel_array.shape
+
+# PhotometricInterpretation 是 DICOM 里的光度解释方式
+# 常见值包括 MONOCHROME1 和 MONOCHROME2
+photometric_interpretation = ds.PhotometricInterpretation
+
+# np.min(pixel_array) 用来获取图像中的最小像素值
+pixel_min = np.min(pixel_array)
+
+# np.max(pixel_array) 用来获取图像中的最大像素值
+pixel_max = np.max(pixel_array)
+
+# 打印 image ID
+print("image_id:", image_id)
+
+# 打印图像宽度
+print("width:", width)
+
+# 打印图像高度
+print("height:", height)
+
+# 打印光度解释方式
+print("PhotometricInterpretation:", photometric_interpretation)
+
+# 打印最小像素值
+print("pixel_min:", pixel_min)
+
+# 打印最大像素值
+print("pixel_max:", pixel_max)
+
+
+# Ⅶ.批量记录前 20 张 DICOM 图像的元数据
+
+# pandas 是 Python 里专门处理表格数据的工具
+# 我们最后要把每张图的元数据整理成表格，所以要用 pandas
+import pandas as pd
+
+# tqdm 是进度条工具
+# 它可以显示当前处理到第几张图
+from tqdm import tqdm
+
+# 找出 train 文件夹下所有 .dicom 文件
+# TRAIN_DIR.glob("*.dicom") 表示查找所有以 .dicom 结尾的文件
+# list(...) 把找到的结果变成列表
+dicom_files = list(TRAIN_DIR.glob("*.dicom"))
+
+# 创建一个空列表，用来保存每张图像的元数据
+metadata_records = []
+
+# 先从全部 DICOM 图像中取前 20 张进行测试
+sample_dicom_files = dicom_files[:20]
+
+# 对前 20 张 DICOM 图像逐张处理
+# tqdm(...) 只是给循环加进度条，不改变核心逻辑
+for dicom_path in tqdm(sample_dicom_files):
+
+    # 使用 pydicom 读取当前这张 DICOM 文件
+    ds = pydicom.dcmread(dicom_path)
+
+    # 从 DICOM 文件中提取图像像素矩阵
+    pixel_array = ds.pixel_array
+
+    # dicom_path.stem 表示只取文件名，不要 .dicom 后缀
+    image_id = dicom_path.stem
+
+    # pixel_array.shape 表示图像矩阵的形状
+    # 对灰度图来说，顺序是 height, width
+    height, width = pixel_array.shape
+
+    # 从 DICOM 元数据中提取光度解释方式
+    photometric_interpretation = ds.PhotometricInterpretation
+
+    # 获取当前图像的最小像素值
+    pixel_min = np.min(pixel_array)
+
+    # 获取当前图像的最大像素值
+    pixel_max = np.max(pixel_array)
+
+    # metadata_records.append(...) 的意思是：
+    # 把当前这张图像的元数据作为一条记录加入 metadata_records 列表
+    metadata_records.append({
+        "image_id": image_id,
+        "split": "train",
+        "width": width,
+        "height": height,
+        "PhotometricInterpretation": photometric_interpretation,
+        "pixel_min": pixel_min,
+        "pixel_max": pixel_max
+    })
+
+# pd.DataFrame(metadata_records) 用 pandas 把记录列表转换成表格
+metadata_df = pd.DataFrame(metadata_records)
+
+# 在 Kaggle Notebook / Jupyter Notebook 里
+# 如果一个变量单独放在最后一行，它会自动显示出来
+metadata_df
