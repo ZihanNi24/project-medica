@@ -1,9 +1,18 @@
 from pathlib import Path
+from contextlib import nullcontext
+from time import perf_counter
 
+import cv2
 import pydicom
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-from PIL import Image
+import torch
+import torchxrayvision as xrv
+
+from tqdm.auto import tqdm
+
+from pydicom.pixels import apply_modality_lut, apply_voi_lut
 
 
 DATA_ROOT = Path(
@@ -12,71 +21,2641 @@ DATA_ROOT = Path(
 )
 
 TRAIN_DIR = DATA_ROOT / "train"
-OUTPUT_DIR = Path("/kaggle/working/preprocessing_demo")
+ANNOTATION_CSV = DATA_ROOT / "train.csv"
 
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_ROOT = Path(
+    "/kaggle/working/preprocessing_demo_v6"
+)
 
-dicom_files = list(TRAIN_DIR.glob("*.dicom"))
+STANDARD_DIR = OUTPUT_ROOT / "standard"
+CLAHE_DIR = OUTPUT_ROOT / "clahe"
+MASK_DIR = OUTPUT_ROOT / "lung_masks"
+ANNOTATED_DIR = OUTPUT_ROOT / "annotated"
+VERIFICATION_DIR = OUTPUT_ROOT / "verification_original"
+MODEL_CACHE_DIR = OUTPUT_ROOT / "model_cache"
 
-target_dicom_path = None
+DEMO_COUNT = 5
+SEGMENTATION_BATCH_SIZE = 8
 
-for dicom_path in dicom_files:
-    ds_header = pydicom.dcmread(
-        dicom_path,
-        stop_before_pixels=True
-    )
+LOWER_PERCENTILE = 1.0
+UPPER_PERCENTILE = 99.0
 
-    if ds_header.PhotometricInterpretation == "MONOCHROME1":
-        target_dicom_path = dicom_path
-        break
+SAVE_MAX_SIDE = 2048
 
-if target_dicom_path is None:
-    raise FileNotFoundError("No MONOCHROME1 DICOM image was found.")
+LUNG_THRESHOLD = 0.50
+LUNG_MARGIN = 0.10
 
-ds = pydicom.dcmread(target_dicom_path)
+CLAHE_CLIP_LIMIT = 2.0
+CLAHE_GRID_SIZE = (8, 8)
 
-pixel_array = ds.pixel_array
-image_id = target_dicom_path.stem
-height, width = pixel_array.shape
-photometric_interpretation = ds.PhotometricInterpretation
-pixel_min = pixel_array.min()
-pixel_max = pixel_array.max()
+USE_VOI_LUT = True
+USE_GPU = True
+USE_MIXED_PRECISION = True
 
-if photometric_interpretation == "MONOCHROME1":
-    processed_pixel_array = (
-        pixel_array.astype(np.int32).max()
-        + pixel_array.astype(np.int32).min()
-        - pixel_array.astype(np.int32)
-    )
+SAVE_STANDARD = False
+SAVE_CLAHE = False
+SAVE_MASK = False
+SAVE_ANNOTATED = True
+SAVE_VERIFICATION_ORIGINAL = True
+SHOW_RESULT = True
+STRICT_ANNOTATION_VERIFICATION = False
+
+PNG_COMPRESSION = 3
+MIN_VISIBLE_FRACTION = 0.0
+TARGET_CLASSES = None
+
+DOCTOR_COLOR_PALETTE = [
+    ("purple", (160, 32, 240)),
+    ("green", (0, 200, 0)),
+    ("red", (255, 0, 0))
+]
+
+
+if USE_GPU and torch.cuda.is_available():
+    DEVICE = torch.device("cuda:0")
 else:
-    processed_pixel_array = pixel_array.astype(np.int32)
+    DEVICE = torch.device("cpu")
 
-processed_pixel_array = processed_pixel_array.astype(np.uint16)
+USE_AMP = (
+    USE_MIXED_PRECISION
+    and DEVICE.type == "cuda"
+)
 
-output_path = OUTPUT_DIR / f"{image_id}_processed.png"
+if DEVICE.type == "cuda":
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.allow_tf32 = True
 
-Image.fromarray(processed_pixel_array).save(output_path)
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
 
-print("Dataset path:", DATA_ROOT)
-print("Number of training DICOM files:", len(dicom_files))
-print("Image ID:", image_id)
-print("Width:", width)
-print("Height:", height)
-print("Photometric Interpretation:", photometric_interpretation)
-print("Original pixel minimum:", pixel_min)
-print("Original pixel maximum:", pixel_max)
-print("Processed pixel minimum:", processed_pixel_array.min())
-print("Processed pixel maximum:", processed_pixel_array.max())
-print("Saved to:", output_path)
+    print("Device: GPU")
+    print("GPU:", torch.cuda.get_device_name(0))
+    print(
+        "GPU memory:",
+        round(
+            torch.cuda.get_device_properties(0).total_memory
+            / 1024 ** 3,
+            2
+        ),
+        "GB"
+    )
+    print("Mixed precision:", USE_AMP)
+else:
+    print("Device: CPU")
+    print(
+        "GPU is not available. "
+        "The program will continue using CPU."
+    )
 
-plt.figure(figsize=(6, 6))
-plt.imshow(pixel_array, cmap="gray")
-plt.axis("off")
-plt.title("Original DICOM Image")
-plt.show()
 
-plt.figure(figsize=(6, 6))
-plt.imshow(processed_pixel_array, cmap="gray")
-plt.axis("off")
-plt.title("Image After MONOCHROME1 Handling")
-plt.show()
+if not TRAIN_DIR.is_dir():
+    raise FileNotFoundError(
+        f"Training directory was not found: {TRAIN_DIR}"
+    )
+
+if not ANNOTATION_CSV.is_file():
+    raise FileNotFoundError(
+        f"Annotation CSV was not found: {ANNOTATION_CSV}"
+    )
+
+
+directories_to_create = [
+    OUTPUT_ROOT,
+    MODEL_CACHE_DIR
+]
+
+if SAVE_STANDARD:
+    directories_to_create.append(STANDARD_DIR)
+
+if SAVE_CLAHE:
+    directories_to_create.append(CLAHE_DIR)
+
+if SAVE_MASK:
+    directories_to_create.append(MASK_DIR)
+
+if SAVE_ANNOTATED:
+    directories_to_create.append(ANNOTATED_DIR)
+
+if SAVE_VERIFICATION_ORIGINAL:
+    directories_to_create.append(VERIFICATION_DIR)
+
+for directory in directories_to_create:
+    directory.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+required_annotation_columns = [
+    "image_id",
+    "rad_id",
+    "class_name",
+    "x_min",
+    "y_min",
+    "x_max",
+    "y_max"
+]
+
+annotations_df = pd.read_csv(
+    ANNOTATION_CSV,
+    usecols=lambda column: (
+        column in required_annotation_columns
+    )
+)
+
+missing_annotation_columns = (
+    set(required_annotation_columns)
+    - set(annotations_df.columns)
+)
+
+if missing_annotation_columns:
+    raise ValueError(
+        "Missing annotation columns: "
+        f"{sorted(missing_annotation_columns)}"
+    )
+
+annotations_df["image_id"] = (
+    annotations_df["image_id"]
+    .astype(str)
+)
+
+annotations_df["rad_id"] = (
+    annotations_df["rad_id"]
+    .fillna("Unknown")
+    .astype(str)
+)
+
+annotations_df["class_name"] = (
+    annotations_df["class_name"]
+    .fillna("Unknown")
+    .astype(str)
+)
+
+annotations_grouped = annotations_df.groupby(
+    "image_id",
+    sort=False
+)
+
+
+lung_model = (
+    xrv.baseline_models.chestx_det.PSPNet(
+        cache_dir=str(MODEL_CACHE_DIR)
+    )
+    .to(DEVICE)
+    .eval()
+)
+
+print(
+    "Lung segmentation model device:",
+    next(lung_model.parameters()).device
+)
+
+
+CLOSING_KERNEL = cv2.getStructuringElement(
+    cv2.MORPH_ELLIPSE,
+    (9, 9)
+)
+
+OPENING_KERNEL = cv2.getStructuringElement(
+    cv2.MORPH_ELLIPSE,
+    (5, 5)
+)
+
+CLAHE_PROCESSOR = cv2.createCLAHE(
+    clipLimit=CLAHE_CLIP_LIMIT,
+    tileGridSize=CLAHE_GRID_SIZE
+)
+
+
+def create_valid_pixel_mask(raw_array, ds):
+
+    if not hasattr(ds, "PixelPaddingValue"):
+        return None
+
+    padding_value = float(
+        ds.PixelPaddingValue
+    )
+
+    if hasattr(ds, "PixelPaddingRangeLimit"):
+
+        padding_limit = float(
+            ds.PixelPaddingRangeLimit
+        )
+
+        padding_lower = min(
+            padding_value,
+            padding_limit
+        )
+
+        padding_upper = max(
+            padding_value,
+            padding_limit
+        )
+
+        return ~(
+            (raw_array >= padding_lower)
+            & (raw_array <= padding_upper)
+        )
+
+    return raw_array != padding_value
+
+
+def get_valid_values(
+    processed_array,
+    valid_mask
+):
+
+    if valid_mask is None:
+        return processed_array.reshape(-1)
+
+    return processed_array[
+        valid_mask
+    ]
+
+
+def standardize_dicom(dicom_path):
+
+    ds = pydicom.dcmread(
+        dicom_path
+    )
+
+    raw_array = ds.pixel_array
+
+    if raw_array.ndim != 2:
+        raise ValueError(
+            f"Only 2D DICOM images are supported: "
+            f"{dicom_path.name}"
+        )
+
+    original_height, original_width = (
+        raw_array.shape
+    )
+
+    valid_mask = create_valid_pixel_mask(
+        raw_array,
+        ds
+    )
+
+    if (
+        valid_mask is not None
+        and not np.any(valid_mask)
+    ):
+        raise ValueError(
+            f"No valid pixels were found: "
+            f"{dicom_path.name}"
+        )
+
+    processed_array = apply_modality_lut(
+        raw_array,
+        ds
+    ).astype(
+        np.float32,
+        copy=False
+    )
+
+    has_voi_information = (
+        hasattr(ds, "VOILUTSequence")
+        or (
+            hasattr(ds, "WindowCenter")
+            and hasattr(ds, "WindowWidth")
+        )
+    )
+
+    voi_applied = False
+
+    if USE_VOI_LUT and has_voi_information:
+
+        try:
+            processed_array = apply_voi_lut(
+                processed_array,
+                ds,
+                index=0
+            ).astype(
+                np.float32,
+                copy=False
+            )
+
+            voi_applied = True
+
+        except Exception:
+            voi_applied = False
+
+    photometric_interpretation = str(
+        ds.PhotometricInterpretation
+    )
+
+    valid_values = get_valid_values(
+        processed_array,
+        valid_mask
+    )
+
+    if photometric_interpretation == "MONOCHROME1":
+
+        processed_array = (
+            valid_values.max()
+            + valid_values.min()
+            - processed_array
+        )
+
+    elif photometric_interpretation != "MONOCHROME2":
+
+        raise ValueError(
+            "Unsupported Photometric Interpretation: "
+            f"{photometric_interpretation}"
+        )
+
+    valid_values = get_valid_values(
+        processed_array,
+        valid_mask
+    )
+
+    lower_value, upper_value = np.percentile(
+        valid_values,
+        [
+            LOWER_PERCENTILE,
+            UPPER_PERCENTILE
+        ]
+    )
+
+    lower_value = float(
+        lower_value
+    )
+
+    upper_value = float(
+        upper_value
+    )
+
+    if (
+        not np.isfinite(lower_value)
+        or not np.isfinite(upper_value)
+        or upper_value <= lower_value
+    ):
+        raise ValueError(
+            f"Invalid intensity range: "
+            f"{dicom_path.name}"
+        )
+
+    np.clip(
+        processed_array,
+        lower_value,
+        upper_value,
+        out=processed_array
+    )
+
+    processed_array -= lower_value
+    processed_array *= (
+        255.0
+        / (upper_value - lower_value)
+    )
+
+    normalized_array = np.rint(
+        processed_array
+    ).astype(
+        np.uint8
+    )
+
+    if valid_mask is not None:
+        normalized_array[
+            ~valid_mask
+        ] = 0
+
+    metadata = {
+        "image_id": dicom_path.stem,
+        "original_width": original_width,
+        "original_height": original_height,
+        "photometric_interpretation":
+            photometric_interpretation,
+        "voi_information_present":
+            has_voi_information,
+        "voi_applied":
+            voi_applied,
+        "lower_value":
+            lower_value,
+        "upper_value":
+            upper_value,
+        "pixel_padding_present":
+            valid_mask is not None,
+        "bits_stored":
+            int(getattr(ds, "BitsStored", 0)),
+        "window_center":
+            str(getattr(ds, "WindowCenter", "")),
+        "window_width":
+            str(getattr(ds, "WindowWidth", ""))
+    }
+
+    return (
+        normalized_array,
+        metadata
+    )
+
+
+def prepare_segmentation_input(
+    image_uint8
+):
+
+    original_height, original_width = (
+        image_uint8.shape
+    )
+
+    square_size = max(
+        original_height,
+        original_width
+    )
+
+    pad_top = (
+        square_size - original_height
+    ) // 2
+
+    pad_bottom = (
+        square_size
+        - original_height
+        - pad_top
+    )
+
+    pad_left = (
+        square_size - original_width
+    ) // 2
+
+    pad_right = (
+        square_size
+        - original_width
+        - pad_left
+    )
+
+    square_image = cv2.copyMakeBorder(
+        image_uint8,
+        pad_top,
+        pad_bottom,
+        pad_left,
+        pad_right,
+        cv2.BORDER_CONSTANT,
+        value=0
+    )
+
+    model_image = cv2.resize(
+        square_image,
+        (512, 512),
+        interpolation=cv2.INTER_AREA
+    )
+
+    model_input = xrv.datasets.normalize(
+        model_image.astype(
+            np.float32
+        ),
+        255
+    )
+
+    model_input = np.ascontiguousarray(
+        model_input[
+            np.newaxis,
+            ...
+        ]
+    )
+
+    geometry = {
+        "original_height":
+            original_height,
+        "original_width":
+            original_width,
+        "square_size":
+            square_size,
+        "pad_top":
+            pad_top,
+        "pad_left":
+            pad_left
+    }
+
+    return (
+        model_input,
+        geometry
+    )
+
+
+def run_segmentation_batch(
+    model_inputs
+):
+
+    batch_array = np.stack(
+        model_inputs,
+        axis=0
+    )
+
+    batch_tensor = torch.from_numpy(
+        batch_array
+    )
+
+    if DEVICE.type == "cuda":
+        batch_tensor = batch_tensor.pin_memory()
+
+    batch_tensor = batch_tensor.to(
+        DEVICE,
+        dtype=torch.float32,
+        non_blocking=(
+            DEVICE.type == "cuda"
+        )
+    )
+
+    autocast_context = (
+        torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16
+        )
+        if USE_AMP
+        else nullcontext()
+    )
+
+    with torch.inference_mode():
+        with autocast_context:
+
+            segmentation_logits = lung_model(
+                batch_tensor
+            )
+
+            combined_lung_probability = (
+                torch.sigmoid(
+                    segmentation_logits[
+                        :,
+                        [4, 5],
+                        :,
+                        :
+                    ]
+                )
+                .amax(dim=1)
+            )
+
+            masks_512 = (
+                combined_lung_probability
+                >= LUNG_THRESHOLD
+            ).to(
+                torch.uint8
+            )
+
+    return (
+        masks_512
+        .cpu()
+        .numpy()
+    )
+
+
+def clean_lung_mask(
+    mask_512
+):
+
+    mask = (
+        mask_512.astype(
+            np.uint8
+        )
+        * 255
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        CLOSING_KERNEL
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        OPENING_KERNEL
+    )
+
+    (
+        number_of_labels,
+        labels,
+        statistics,
+        _
+    ) = cv2.connectedComponentsWithStats(
+        mask,
+        connectivity=8
+    )
+
+    if number_of_labels <= 1:
+        raise ValueError(
+            "No lung region was detected."
+        )
+
+    component_areas = statistics[
+        1:,
+        cv2.CC_STAT_AREA
+    ]
+
+    selected_label_indices = (
+        np.argsort(
+            component_areas
+        )[-2:]
+        + 1
+    )
+
+    cleaned_mask = np.isin(
+        labels,
+        selected_label_indices
+    ).astype(
+        np.uint8
+    ) * 255
+
+    return cv2.morphologyEx(
+        cleaned_mask,
+        cv2.MORPH_CLOSE,
+        CLOSING_KERNEL
+    )
+
+
+def restore_lung_mask(
+    mask_512,
+    geometry
+):
+
+    cleaned_mask = clean_lung_mask(
+        mask_512
+    )
+
+    square_size = geometry[
+        "square_size"
+    ]
+
+    square_mask = cv2.resize(
+        cleaned_mask,
+        (
+            square_size,
+            square_size
+        ),
+        interpolation=cv2.INTER_NEAREST
+    )
+
+    pad_top = geometry[
+        "pad_top"
+    ]
+
+    pad_left = geometry[
+        "pad_left"
+    ]
+
+    original_height = geometry[
+        "original_height"
+    ]
+
+    original_width = geometry[
+        "original_width"
+    ]
+
+    lung_mask = square_mask[
+        pad_top:
+            pad_top + original_height,
+        pad_left:
+            pad_left + original_width
+    ]
+
+    lung_mask = (
+        lung_mask > 0
+    ).astype(
+        np.uint8
+    )
+
+    lung_area_fraction = float(
+        lung_mask.mean()
+    )
+
+    if (
+        lung_area_fraction < 0.08
+        or lung_area_fraction > 0.80
+    ):
+        raise ValueError(
+            "The detected lung area is abnormal: "
+            f"{lung_area_fraction:.4f}"
+        )
+
+    return (
+        lung_mask,
+        lung_area_fraction
+    )
+
+
+def calculate_lung_crop(
+    lung_mask
+):
+
+    y_coordinates, x_coordinates = np.where(
+        lung_mask > 0
+    )
+
+    if len(x_coordinates) == 0:
+        raise ValueError(
+            "The lung mask is empty."
+        )
+
+    image_height, image_width = (
+        lung_mask.shape
+    )
+
+    lung_x_min = int(
+        x_coordinates.min()
+    )
+
+    lung_x_max = int(
+        x_coordinates.max()
+    ) + 1
+
+    lung_y_min = int(
+        y_coordinates.min()
+    )
+
+    lung_y_max = int(
+        y_coordinates.max()
+    ) + 1
+
+    lung_width = (
+        lung_x_max - lung_x_min
+    )
+
+    lung_height = (
+        lung_y_max - lung_y_min
+    )
+
+    margin_x = round(
+        lung_width * LUNG_MARGIN
+    )
+
+    margin_y = round(
+        lung_height * LUNG_MARGIN
+    )
+
+    crop_x_min = max(
+        0,
+        lung_x_min - margin_x
+    )
+
+    crop_x_max = min(
+        image_width,
+        lung_x_max + margin_x
+    )
+
+    crop_y_min = max(
+        0,
+        lung_y_min - margin_y
+    )
+
+    crop_y_max = min(
+        image_height,
+        lung_y_max + margin_y
+    )
+
+    return (
+        crop_x_min,
+        crop_y_min,
+        crop_x_max,
+        crop_y_max
+    )
+
+
+def resize_preserving_aspect_ratio(
+    image_uint8,
+    max_side,
+    interpolation
+):
+
+    original_height, original_width = (
+        image_uint8.shape[:2]
+    )
+
+    scale_factor = min(
+        1.0,
+        max_side
+        / max(
+            original_width,
+            original_height
+        )
+    )
+
+    output_width = max(
+        1,
+        round(
+            original_width
+            * scale_factor
+        )
+    )
+
+    output_height = max(
+        1,
+        round(
+            original_height
+            * scale_factor
+        )
+    )
+
+    if scale_factor < 1.0:
+
+        resized_image = cv2.resize(
+            image_uint8,
+            (
+                output_width,
+                output_height
+            ),
+            interpolation=interpolation
+        )
+
+    else:
+
+        resized_image = image_uint8.copy()
+
+    actual_output_height, actual_output_width = (
+        resized_image.shape[:2]
+    )
+
+    scale_x = (
+        actual_output_width
+        / original_width
+    )
+
+    scale_y = (
+        actual_output_height
+        / original_height
+    )
+
+    return (
+        resized_image,
+        scale_x,
+        scale_y
+    )
+
+
+def get_image_annotations(
+    image_id
+):
+
+    if image_id not in annotations_grouped.groups:
+        return annotations_df.iloc[0:0].copy()
+
+    image_annotations = (
+        annotations_grouped
+        .get_group(image_id)
+        .copy()
+    )
+
+    if TARGET_CLASSES is not None:
+
+        image_annotations = image_annotations[
+            image_annotations[
+                "class_name"
+            ].isin(
+                TARGET_CLASSES
+            )
+        ].copy()
+
+    return image_annotations
+
+
+def assign_doctor_colors(
+    image_annotations
+):
+
+    doctor_ids = sorted(
+        image_annotations[
+            "rad_id"
+        ]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+    doctor_color_map = {}
+
+    for index, doctor_id in enumerate(
+        doctor_ids
+    ):
+
+        color_name, color_rgb = (
+            DOCTOR_COLOR_PALETTE[
+                index
+                % len(
+                    DOCTOR_COLOR_PALETTE
+                )
+            ]
+        )
+
+        doctor_color_map[
+            doctor_id
+        ] = {
+            "name": color_name,
+            "rgb": color_rgb
+        }
+
+    return doctor_color_map
+
+
+def transform_annotations(
+    image_id,
+    crop_coordinates,
+    scale_x,
+    scale_y,
+    output_width,
+    output_height
+):
+
+    image_annotations = get_image_annotations(
+        image_id
+    )
+
+    if image_annotations.empty:
+        return (
+            image_annotations,
+            {}
+        )
+
+    doctor_color_map = assign_doctor_colors(
+        image_annotations
+    )
+
+    image_annotations[
+        "doctor_color_name"
+    ] = image_annotations[
+        "rad_id"
+    ].map(
+        lambda doctor_id: (
+            doctor_color_map[
+                str(doctor_id)
+            ]["name"]
+        )
+    )
+
+    image_annotations[
+        "doctor_color_rgb"
+    ] = image_annotations[
+        "rad_id"
+    ].map(
+        lambda doctor_id: ",".join(
+            map(
+                str,
+                doctor_color_map[
+                    str(doctor_id)
+                ]["rgb"]
+            )
+        )
+    )
+
+    coordinate_columns = [
+        "x_min",
+        "y_min",
+        "x_max",
+        "y_max"
+    ]
+
+    has_coordinates = (
+        image_annotations[
+            coordinate_columns
+        ]
+        .notna()
+        .all(axis=1)
+    )
+
+    image_annotations[
+        "box_has_coordinates"
+    ] = has_coordinates
+
+    image_annotations[
+        "box_intersects_crop"
+    ] = False
+
+    image_annotations[
+        "visible_fraction"
+    ] = np.nan
+
+    for column_name in [
+        "x_min_processed",
+        "y_min_processed",
+        "x_max_processed",
+        "y_max_processed"
+    ]:
+        image_annotations[
+            column_name
+        ] = np.nan
+
+    if not has_coordinates.any():
+        return (
+            image_annotations,
+            doctor_color_map
+        )
+
+    valid_rows = image_annotations[
+        has_coordinates
+    ].copy()
+
+    (
+        crop_x_min,
+        crop_y_min,
+        crop_x_max,
+        crop_y_max
+    ) = crop_coordinates
+
+    intersection_x_min = np.maximum(
+        valid_rows["x_min"],
+        crop_x_min
+    )
+
+    intersection_y_min = np.maximum(
+        valid_rows["y_min"],
+        crop_y_min
+    )
+
+    intersection_x_max = np.minimum(
+        valid_rows["x_max"],
+        crop_x_max
+    )
+
+    intersection_y_max = np.minimum(
+        valid_rows["y_max"],
+        crop_y_max
+    )
+
+    intersection_width = np.maximum(
+        0,
+        intersection_x_max
+        - intersection_x_min
+    )
+
+    intersection_height = np.maximum(
+        0,
+        intersection_y_max
+        - intersection_y_min
+    )
+
+    intersection_area = (
+        intersection_width
+        * intersection_height
+    )
+
+    original_box_area = np.maximum(
+        0,
+        (
+            valid_rows["x_max"]
+            - valid_rows["x_min"]
+        )
+        * (
+            valid_rows["y_max"]
+            - valid_rows["y_min"]
+        )
+    )
+
+    box_intersects_crop = (
+        intersection_area > 0
+    )
+
+    visible_fraction = np.where(
+        original_box_area > 0,
+        intersection_area
+        / original_box_area,
+        0
+    )
+
+    processed_x_min = np.clip(
+        (
+            intersection_x_min
+            - crop_x_min
+        )
+        * scale_x,
+        0,
+        output_width - 1
+    )
+
+    processed_y_min = np.clip(
+        (
+            intersection_y_min
+            - crop_y_min
+        )
+        * scale_y,
+        0,
+        output_height - 1
+    )
+
+    processed_x_max = np.clip(
+        (
+            intersection_x_max
+            - crop_x_min
+        )
+        * scale_x,
+        0,
+        output_width - 1
+    )
+
+    processed_y_max = np.clip(
+        (
+            intersection_y_max
+            - crop_y_min
+        )
+        * scale_y,
+        0,
+        output_height - 1
+    )
+
+    valid_indices = valid_rows.index
+
+    image_annotations.loc[
+        valid_indices,
+        "box_intersects_crop"
+    ] = box_intersects_crop
+
+    image_annotations.loc[
+        valid_indices,
+        "visible_fraction"
+    ] = visible_fraction
+
+    image_annotations.loc[
+        valid_indices,
+        "x_min_processed"
+    ] = processed_x_min
+
+    image_annotations.loc[
+        valid_indices,
+        "y_min_processed"
+    ] = processed_y_min
+
+    image_annotations.loc[
+        valid_indices,
+        "x_max_processed"
+    ] = processed_x_max
+
+    image_annotations.loc[
+        valid_indices,
+        "y_max_processed"
+    ] = processed_y_max
+
+    return (
+        image_annotations,
+        doctor_color_map
+    )
+
+
+def draw_doctor_annotations(
+    image_uint8,
+    transformed_annotations,
+    doctor_color_map
+):
+
+    annotated_image = cv2.cvtColor(
+        image_uint8,
+        cv2.COLOR_GRAY2RGB
+    )
+
+    if transformed_annotations.empty:
+        return annotated_image
+
+    output_height, output_width = (
+        image_uint8.shape
+    )
+
+    line_width = max(
+        2,
+        round(
+            output_width / 650
+        )
+    )
+
+    font_scale = float(
+        np.clip(
+            output_width / 1900,
+            0.55,
+            0.95
+        )
+    )
+
+    text_thickness = max(
+        1,
+        line_width - 1
+    )
+
+    drawable_annotations = (
+        transformed_annotations[
+            transformed_annotations[
+                "box_intersects_crop"
+            ]
+            & (
+                transformed_annotations[
+                    "visible_fraction"
+                ]
+                >= MIN_VISIBLE_FRACTION
+            )
+        ]
+    )
+
+    for row in drawable_annotations.itertuples(
+        index=False
+    ):
+
+        x_min = int(round(
+            row.x_min_processed
+        ))
+
+        y_min = int(round(
+            row.y_min_processed
+        ))
+
+        x_max = int(round(
+            row.x_max_processed
+        ))
+
+        y_max = int(round(
+            row.y_max_processed
+        ))
+
+        doctor_id = str(
+            row.rad_id
+        )
+
+        color_rgb = doctor_color_map[
+            doctor_id
+        ]["rgb"]
+
+        cv2.rectangle(
+            annotated_image,
+            (
+                x_min,
+                y_min
+            ),
+            (
+                x_max,
+                y_max
+            ),
+            color_rgb,
+            line_width
+        )
+
+        label_text = (
+            f"{doctor_id} | "
+            f"{row.class_name}"
+        )
+
+        (
+            text_width,
+            text_height
+        ), baseline = cv2.getTextSize(
+            label_text,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            text_thickness
+        )
+
+        text_x = int(
+            np.clip(
+                x_min,
+                0,
+                max(
+                    0,
+                    output_width
+                    - text_width
+                    - 8
+                )
+            )
+        )
+
+        if (
+            y_min
+            - text_height
+            - baseline
+            - 8
+            >= 0
+        ):
+            text_baseline_y = (
+                y_min - 6
+            )
+        else:
+            text_baseline_y = min(
+                output_height - 4,
+                y_min
+                + text_height
+                + baseline
+                + 8
+            )
+
+        background_top = max(
+            0,
+            text_baseline_y
+            - text_height
+            - baseline
+            - 4
+        )
+
+        background_bottom = min(
+            output_height - 1,
+            text_baseline_y
+            + baseline
+            + 2
+        )
+
+        cv2.rectangle(
+            annotated_image,
+            (
+                text_x,
+                background_top
+            ),
+            (
+                min(
+                    output_width - 1,
+                    text_x
+                    + text_width
+                    + 8
+                ),
+                background_bottom
+            ),
+            color_rgb,
+            thickness=-1
+        )
+
+        cv2.putText(
+            annotated_image,
+            label_text,
+            (
+                text_x + 4,
+                text_baseline_y
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            text_thickness,
+            cv2.LINE_AA
+        )
+
+    return annotated_image
+
+
+
+def verify_annotation_alignment(
+    dicom_path,
+    original_image,
+    transformed_annotations,
+    output_width,
+    output_height
+):
+
+    image_id = dicom_path.stem
+    original_height, original_width = (
+        original_image.shape
+    )
+
+    annotation_row_count = len(
+        transformed_annotations
+    )
+
+    if annotation_row_count > 0:
+
+        csv_image_ids = (
+            transformed_annotations[
+                "image_id"
+            ]
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+
+        image_id_match = (
+            len(csv_image_ids) == 1
+            and csv_image_ids[0] == image_id
+        )
+
+    else:
+
+        csv_image_ids = []
+        image_id_match = False
+
+    coordinate_columns = [
+        "x_min",
+        "y_min",
+        "x_max",
+        "y_max"
+    ]
+
+    if annotation_row_count > 0:
+
+        coordinate_presence_count = (
+            transformed_annotations[
+                coordinate_columns
+            ]
+            .notna()
+            .sum(axis=1)
+        )
+
+        partial_coordinate_row_count = int(
+            (
+                (coordinate_presence_count > 0)
+                & (coordinate_presence_count < 4)
+            ).sum()
+        )
+
+        box_rows = transformed_annotations[
+            coordinate_presence_count == 4
+        ].copy()
+
+        no_box_rows = transformed_annotations[
+            coordinate_presence_count == 0
+        ].copy()
+
+    else:
+
+        partial_coordinate_row_count = 0
+        box_rows = transformed_annotations.copy()
+        no_box_rows = transformed_annotations.copy()
+
+    bounding_box_count = len(
+        box_rows
+    )
+
+    no_box_row_count = len(
+        no_box_rows
+    )
+
+    if no_box_row_count > 0:
+
+        no_box_rows_are_no_finding = bool(
+            no_box_rows[
+                "class_name"
+            ]
+            .astype(str)
+            .str.strip()
+            .str.casefold()
+            .eq("no finding")
+            .all()
+        )
+
+    else:
+
+        no_box_rows_are_no_finding = True
+
+    if bounding_box_count > 0:
+
+        box_values = box_rows[
+            coordinate_columns
+        ].to_numpy(
+            dtype=np.float64
+        )
+
+        all_box_values_finite = bool(
+            np.isfinite(
+                box_values
+            ).all()
+        )
+
+        all_boxes_positive_area = bool(
+            (
+                box_rows["x_max"]
+                > box_rows["x_min"]
+            ).all()
+            and (
+                box_rows["y_max"]
+                > box_rows["y_min"]
+            ).all()
+        )
+
+        all_boxes_within_original_bounds = bool(
+            (
+                box_rows["x_min"] >= 0
+            ).all()
+            and (
+                box_rows["y_min"] >= 0
+            ).all()
+            and (
+                box_rows["x_max"]
+                <= original_width
+            ).all()
+            and (
+                box_rows["y_max"]
+                <= original_height
+            ).all()
+        )
+
+        intersecting_box_count = int(
+            box_rows[
+                "box_intersects_crop"
+            ].fillna(False).sum()
+        )
+
+        outside_crop_box_count = int(
+            bounding_box_count
+            - intersecting_box_count
+        )
+
+        partially_clipped_box_count = int(
+            (
+                box_rows[
+                    "box_intersects_crop"
+                ].fillna(False)
+                & (
+                    box_rows[
+                        "visible_fraction"
+                    ].fillna(0)
+                    < 0.999
+                )
+            ).sum()
+        )
+
+        processed_box_rows = box_rows[
+            box_rows[
+                "box_intersects_crop"
+            ].fillna(False)
+        ]
+
+        if len(processed_box_rows) > 0:
+
+            processed_boxes_valid = bool(
+                processed_box_rows[
+                    [
+                        "x_min_processed",
+                        "y_min_processed",
+                        "x_max_processed",
+                        "y_max_processed"
+                    ]
+                ]
+                .notna()
+                .all()
+                .all()
+                and (
+                    processed_box_rows[
+                        "x_max_processed"
+                    ]
+                    > processed_box_rows[
+                        "x_min_processed"
+                    ]
+                ).all()
+                and (
+                    processed_box_rows[
+                        "y_max_processed"
+                    ]
+                    > processed_box_rows[
+                        "y_min_processed"
+                    ]
+                ).all()
+                and (
+                    processed_box_rows[
+                        "x_min_processed"
+                    ] >= 0
+                ).all()
+                and (
+                    processed_box_rows[
+                        "y_min_processed"
+                    ] >= 0
+                ).all()
+                and (
+                    processed_box_rows[
+                        "x_max_processed"
+                    ] < output_width
+                ).all()
+                and (
+                    processed_box_rows[
+                        "y_max_processed"
+                    ] < output_height
+                ).all()
+            )
+
+        else:
+
+            processed_boxes_valid = (
+                bounding_box_count == 0
+            )
+
+    else:
+
+        all_box_values_finite = True
+        all_boxes_positive_area = True
+        all_boxes_within_original_bounds = True
+        intersecting_box_count = 0
+        outside_crop_box_count = 0
+        partially_clipped_box_count = 0
+        processed_boxes_valid = True
+
+    coordinate_alignment_pass = bool(
+        partial_coordinate_row_count == 0
+        and all_box_values_finite
+        and all_boxes_positive_area
+        and all_boxes_within_original_bounds
+        and no_box_rows_are_no_finding
+    )
+
+    if annotation_row_count == 0:
+
+        verification_status = (
+            "FAIL_NO_MATCHED_CSV_ROWS"
+        )
+
+    elif not image_id_match:
+
+        verification_status = (
+            "FAIL_IMAGE_ID_MISMATCH"
+        )
+
+    elif not coordinate_alignment_pass:
+
+        verification_status = (
+            "FAIL_INVALID_OR_OUT_OF_BOUNDS_BOX"
+        )
+
+    elif not processed_boxes_valid:
+
+        verification_status = (
+            "FAIL_PROCESSED_BOX_COORDINATES"
+        )
+
+    elif (
+        outside_crop_box_count > 0
+        or partially_clipped_box_count > 0
+    ):
+
+        verification_status = (
+            "PASS_ID_AND_ORIGINAL_COORDINATES_"
+            "WITH_CROP_WARNING"
+        )
+
+    elif bounding_box_count == 0:
+
+        verification_status = (
+            "PASS_NO_FINDING_WITHOUT_BOX"
+        )
+
+    else:
+
+        verification_status = "PASS"
+
+    verification_pass = (
+        verification_status.startswith(
+            "PASS"
+        )
+    )
+
+    return {
+        "image_id":
+            image_id,
+        "dicom_filename":
+            dicom_path.name,
+        "csv_image_ids":
+            "|".join(
+                csv_image_ids
+            ),
+        "annotation_row_count":
+            annotation_row_count,
+        "bounding_box_count":
+            bounding_box_count,
+        "no_box_row_count":
+            no_box_row_count,
+        "partial_coordinate_row_count":
+            partial_coordinate_row_count,
+        "original_width":
+            original_width,
+        "original_height":
+            original_height,
+        "filename_matches_csv_image_id":
+            image_id_match,
+        "all_box_values_finite":
+            all_box_values_finite,
+        "all_boxes_positive_area":
+            all_boxes_positive_area,
+        "all_boxes_within_original_bounds":
+            all_boxes_within_original_bounds,
+        "no_box_rows_are_no_finding":
+            no_box_rows_are_no_finding,
+        "intersecting_box_count":
+            intersecting_box_count,
+        "outside_crop_box_count":
+            outside_crop_box_count,
+        "partially_clipped_box_count":
+            partially_clipped_box_count,
+        "processed_boxes_valid":
+            processed_boxes_valid,
+        "verification_pass":
+            verification_pass,
+        "verification_status":
+            verification_status,
+        "verification_scope":
+            (
+                "Checks image_id matching, original "
+                "coordinate validity, and transformed "
+                "coordinate validity. It does not verify "
+                "the medical correctness of radiologist "
+                "annotations."
+            )
+    }
+
+
+def draw_original_annotations(
+    original_image,
+    transformed_annotations,
+    doctor_color_map
+):
+
+    annotated_image = cv2.cvtColor(
+        original_image,
+        cv2.COLOR_GRAY2RGB
+    )
+
+    if transformed_annotations.empty:
+        return annotated_image
+
+    original_height, original_width = (
+        original_image.shape
+    )
+
+    line_width = max(
+        2,
+        round(
+            original_width / 650
+        )
+    )
+
+    font_scale = float(
+        np.clip(
+            original_width / 1900,
+            0.55,
+            0.95
+        )
+    )
+
+    text_thickness = max(
+        1,
+        line_width - 1
+    )
+
+    coordinate_columns = [
+        "x_min",
+        "y_min",
+        "x_max",
+        "y_max"
+    ]
+
+    drawable_annotations = (
+        transformed_annotations[
+            transformed_annotations[
+                coordinate_columns
+            ]
+            .notna()
+            .all(axis=1)
+        ]
+    )
+
+    for row in drawable_annotations.itertuples(
+        index=False
+    ):
+
+        x_min = int(round(
+            row.x_min
+        ))
+
+        y_min = int(round(
+            row.y_min
+        ))
+
+        x_max = int(round(
+            row.x_max
+        ))
+
+        y_max = int(round(
+            row.y_max
+        ))
+
+        if (
+            x_min < 0
+            or y_min < 0
+            or x_max > original_width
+            or y_max > original_height
+            or x_max <= x_min
+            or y_max <= y_min
+        ):
+            continue
+
+        doctor_id = str(
+            row.rad_id
+        )
+
+        color_rgb = doctor_color_map[
+            doctor_id
+        ]["rgb"]
+
+        cv2.rectangle(
+            annotated_image,
+            (
+                x_min,
+                y_min
+            ),
+            (
+                x_max,
+                y_max
+            ),
+            color_rgb,
+            line_width
+        )
+
+        label_text = (
+            f"{doctor_id} | "
+            f"{row.class_name}"
+        )
+
+        (
+            text_width,
+            text_height
+        ), baseline = cv2.getTextSize(
+            label_text,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            text_thickness
+        )
+
+        text_x = int(
+            np.clip(
+                x_min,
+                0,
+                max(
+                    0,
+                    original_width
+                    - text_width
+                    - 8
+                )
+            )
+        )
+
+        if (
+            y_min
+            - text_height
+            - baseline
+            - 8
+            >= 0
+        ):
+            text_baseline_y = (
+                y_min - 6
+            )
+        else:
+            text_baseline_y = min(
+                original_height - 4,
+                y_min
+                + text_height
+                + baseline
+                + 8
+            )
+
+        background_top = max(
+            0,
+            text_baseline_y
+            - text_height
+            - baseline
+            - 4
+        )
+
+        background_bottom = min(
+            original_height - 1,
+            text_baseline_y
+            + baseline
+            + 2
+        )
+
+        cv2.rectangle(
+            annotated_image,
+            (
+                text_x,
+                background_top
+            ),
+            (
+                min(
+                    original_width - 1,
+                    text_x
+                    + text_width
+                    + 8
+                ),
+                background_bottom
+            ),
+            color_rgb,
+            thickness=-1
+        )
+
+        cv2.putText(
+            annotated_image,
+            label_text,
+            (
+                text_x + 4,
+                text_baseline_y
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            text_thickness,
+            cv2.LINE_AA
+        )
+
+    return annotated_image
+
+
+def save_png(
+    output_path,
+    image_array
+):
+
+    if image_array.ndim == 3:
+        image_to_write = cv2.cvtColor(
+            image_array,
+            cv2.COLOR_RGB2BGR
+        )
+    else:
+        image_to_write = image_array
+
+    saved = cv2.imwrite(
+        str(output_path),
+        image_to_write,
+        [
+            cv2.IMWRITE_PNG_COMPRESSION,
+            PNG_COMPRESSION
+        ]
+    )
+
+    if not saved:
+        raise IOError(
+            f"Failed to save image: {output_path}"
+        )
+
+
+dicom_files = sorted(
+    TRAIN_DIR.glob("*.dicom")
+)[:DEMO_COUNT]
+
+if len(dicom_files) == 0:
+    raise FileNotFoundError(
+        f"No DICOM files were found in: "
+        f"{TRAIN_DIR}"
+    )
+
+print(
+    "Demo DICOM count:",
+    len(dicom_files)
+)
+
+manifest_records = []
+failed_records = []
+verification_records = []
+processed_annotation_frames = []
+
+start_time = perf_counter()
+
+progress_bar = tqdm(
+    total=len(dicom_files),
+    desc="Preprocessing DICOM"
+)
+
+
+for batch_start in range(
+    0,
+    len(dicom_files),
+    SEGMENTATION_BATCH_SIZE
+):
+
+    batch_paths = dicom_files[
+        batch_start:
+            batch_start
+            + SEGMENTATION_BATCH_SIZE
+    ]
+
+    prepared_items = []
+    model_inputs = []
+
+    for dicom_path in batch_paths:
+
+        try:
+
+            (
+                full_standard_image,
+                metadata
+            ) = standardize_dicom(
+                dicom_path
+            )
+
+            (
+                model_input,
+                segmentation_geometry
+            ) = prepare_segmentation_input(
+                full_standard_image
+            )
+
+            prepared_items.append(
+                {
+                    "path":
+                        dicom_path,
+                    "image":
+                        full_standard_image,
+                    "metadata":
+                        metadata,
+                    "geometry":
+                        segmentation_geometry
+                }
+            )
+
+            model_inputs.append(
+                model_input
+            )
+
+        except Exception as error:
+
+            failed_records.append(
+                {
+                    "image_id":
+                        dicom_path.stem,
+                    "error":
+                        str(error)
+                }
+            )
+
+            progress_bar.update(1)
+
+    if len(prepared_items) == 0:
+        continue
+
+    try:
+
+        batch_masks_512 = run_segmentation_batch(
+            model_inputs
+        )
+
+    except Exception as error:
+
+        for item in prepared_items:
+
+            failed_records.append(
+                {
+                    "image_id":
+                        item["metadata"][
+                            "image_id"
+                        ],
+                    "error":
+                        "Batch segmentation failed: "
+                        f"{error}"
+                }
+            )
+
+            progress_bar.update(1)
+
+        continue
+
+    for item, mask_512 in zip(
+        prepared_items,
+        batch_masks_512
+    ):
+
+        dicom_path = item["path"]
+        full_standard_image = item["image"]
+        metadata = item["metadata"]
+
+        try:
+
+            (
+                lung_mask,
+                lung_area_fraction
+            ) = restore_lung_mask(
+                mask_512,
+                item["geometry"]
+            )
+
+            crop_coordinates = calculate_lung_crop(
+                lung_mask
+            )
+
+            (
+                crop_x_min,
+                crop_y_min,
+                crop_x_max,
+                crop_y_max
+            ) = crop_coordinates
+
+            standard_crop = full_standard_image[
+                crop_y_min:crop_y_max,
+                crop_x_min:crop_x_max
+            ]
+
+            (
+                standard_output,
+                scale_x,
+                scale_y
+            ) = resize_preserving_aspect_ratio(
+                standard_crop,
+                SAVE_MAX_SIDE,
+                cv2.INTER_AREA
+            )
+
+            clahe_output = CLAHE_PROCESSOR.apply(
+                standard_output
+            )
+
+            output_height, output_width = (
+                standard_output.shape
+            )
+
+            image_id = metadata[
+                "image_id"
+            ]
+
+            (
+                transformed_annotations,
+                doctor_color_map
+            ) = transform_annotations(
+                image_id,
+                crop_coordinates,
+                scale_x,
+                scale_y,
+                output_width,
+                output_height
+            )
+
+            if not transformed_annotations.empty:
+
+                processed_annotation_frames.append(
+                    transformed_annotations
+                )
+
+            verification_record = verify_annotation_alignment(
+                dicom_path,
+                full_standard_image,
+                transformed_annotations,
+                output_width,
+                output_height
+            )
+
+            verification_records.append(
+                verification_record
+            )
+
+            if (
+                STRICT_ANNOTATION_VERIFICATION
+                and not verification_record[
+                    "verification_pass"
+                ]
+            ):
+                raise ValueError(
+                    "Annotation verification failed: "
+                    f"{verification_record['verification_status']}"
+                )
+
+            original_verification_output = (
+                draw_original_annotations(
+                    full_standard_image,
+                    transformed_annotations,
+                    doctor_color_map
+                )
+            )
+
+            annotated_output = draw_doctor_annotations(
+                clahe_output,
+                transformed_annotations,
+                doctor_color_map
+            )
+
+            standard_path = (
+                STANDARD_DIR
+                / f"{image_id}.png"
+            )
+
+            clahe_path = (
+                CLAHE_DIR
+                / f"{image_id}.png"
+            )
+
+            mask_path = (
+                MASK_DIR
+                / f"{image_id}.png"
+            )
+
+            annotated_path = (
+                ANNOTATED_DIR
+                / f"{image_id}.png"
+            )
+
+            verification_path = (
+                VERIFICATION_DIR
+                / f"{image_id}.png"
+            )
+
+            if SAVE_STANDARD:
+                save_png(
+                    standard_path,
+                    standard_output
+                )
+
+            if SAVE_CLAHE:
+                save_png(
+                    clahe_path,
+                    clahe_output
+                )
+
+            if SAVE_MASK:
+
+                mask_crop = lung_mask[
+                    crop_y_min:crop_y_max,
+                    crop_x_min:crop_x_max
+                ]
+
+                mask_output = cv2.resize(
+                    (
+                        mask_crop * 255
+                    ).astype(
+                        np.uint8
+                    ),
+                    (
+                        output_width,
+                        output_height
+                    ),
+                    interpolation=cv2.INTER_NEAREST
+                )
+
+                save_png(
+                    mask_path,
+                    mask_output
+                )
+
+            if SAVE_ANNOTATED:
+                save_png(
+                    annotated_path,
+                    annotated_output
+                )
+
+            if SAVE_VERIFICATION_ORIGINAL:
+                save_png(
+                    verification_path,
+                    original_verification_output
+                )
+
+            metadata.update(
+                {
+                    "crop_x_min":
+                        crop_x_min,
+                    "crop_y_min":
+                        crop_y_min,
+                    "crop_x_max":
+                        crop_x_max,
+                    "crop_y_max":
+                        crop_y_max,
+                    "cropped_width":
+                        crop_x_max
+                        - crop_x_min,
+                    "cropped_height":
+                        crop_y_max
+                        - crop_y_min,
+                    "output_width":
+                        output_width,
+                    "output_height":
+                        output_height,
+                    "scale_x":
+                        scale_x,
+                    "scale_y":
+                        scale_y,
+                    "lung_area_fraction":
+                        lung_area_fraction,
+                    "lung_threshold":
+                        LUNG_THRESHOLD,
+                    "lung_margin":
+                        LUNG_MARGIN,
+                    "doctor_count":
+                        len(
+                            doctor_color_map
+                        ),
+                    "annotation_count":
+                        len(
+                            transformed_annotations
+                        ),
+                    "standard_path":
+                        (
+                            str(standard_path)
+                            if SAVE_STANDARD
+                            else ""
+                        ),
+                    "clahe_path":
+                        (
+                            str(clahe_path)
+                            if SAVE_CLAHE
+                            else ""
+                        ),
+                    "lung_mask_path":
+                        (
+                            str(mask_path)
+                            if SAVE_MASK
+                            else ""
+                        ),
+                    "annotated_path":
+                        (
+                            str(annotated_path)
+                            if SAVE_ANNOTATED
+                            else ""
+                        ),
+                    "verification_original_path":
+                        (
+                            str(verification_path)
+                            if SAVE_VERIFICATION_ORIGINAL
+                            else ""
+                        ),
+                    "annotation_verification_status":
+                        verification_record[
+                            "verification_status"
+                        ],
+                    "annotation_verification_pass":
+                        verification_record[
+                            "verification_pass"
+                        ],
+                    "segmentation_device":
+                        str(DEVICE),
+                    "mixed_precision":
+                        USE_AMP
+                }
+            )
+
+            manifest_records.append(
+                metadata
+            )
+
+            print()
+            print("Image ID:", image_id)
+            print(
+                "Annotation verification:",
+                verification_record[
+                    "verification_status"
+                ]
+            )
+            print(
+                "Matched CSV rows:",
+                verification_record[
+                    "annotation_row_count"
+                ]
+            )
+            print(
+                "Original bounding boxes:",
+                verification_record[
+                    "bounding_box_count"
+                ]
+            )
+            print(
+                "Doctor-color mapping:"
+            )
+
+            if len(doctor_color_map) == 0:
+                print("  No radiologist boxes")
+            else:
+                for (
+                    doctor_id,
+                    color_information
+                ) in doctor_color_map.items():
+
+                    print(
+                        f"  {doctor_id}: "
+                        f"{color_information['name']} "
+                        f"{color_information['rgb']}"
+                    )
+
+            if SHOW_RESULT:
+
+                figure, axes = plt.subplots(
+                    1,
+                    2,
+                    figsize=(16, 8)
+                )
+
+                axes[0].imshow(
+                    original_verification_output
+                )
+
+                axes[0].axis("off")
+
+                axes[0].set_title(
+                    "Original DICOM coordinate check\n"
+                    f"{verification_record['verification_status']}"
+                )
+
+                axes[1].imshow(
+                    annotated_output
+                )
+
+                axes[1].axis("off")
+
+                axes[1].set_title(
+                    "Processed image with transformed boxes"
+                )
+
+                figure.suptitle(
+                    f"Annotation alignment verification: {image_id}"
+                )
+
+                plt.tight_layout()
+                plt.show()
+                plt.close(
+                    figure
+                )
+
+        except Exception as error:
+
+            failed_records.append(
+                {
+                    "image_id":
+                        dicom_path.stem,
+                    "error":
+                        str(error)
+                }
+            )
+
+        finally:
+            progress_bar.update(1)
+
+
+progress_bar.close()
+
+
+manifest_df = pd.DataFrame(
+    manifest_records
+)
+
+manifest_path = (
+    OUTPUT_ROOT
+    / "preprocessing_manifest_demo_v6.csv"
+)
+
+manifest_df.to_csv(
+    manifest_path,
+    index=False
+)
+
+
+failed_df = pd.DataFrame(
+    failed_records
+)
+
+failed_path = (
+    OUTPUT_ROOT
+    / "failed_images_demo_v6.csv"
+)
+
+failed_df.to_csv(
+    failed_path,
+    index=False
+)
+
+
+if processed_annotation_frames:
+
+    processed_annotations_df = pd.concat(
+        processed_annotation_frames,
+        ignore_index=True
+    )
+
+else:
+
+    processed_annotations_df = pd.DataFrame(
+        columns=(
+            required_annotation_columns
+            + [
+                "doctor_color_name",
+                "doctor_color_rgb",
+                "box_has_coordinates",
+                "box_intersects_crop",
+                "visible_fraction",
+                "x_min_processed",
+                "y_min_processed",
+                "x_max_processed",
+                "y_max_processed"
+            ]
+        )
+    )
+
+
+processed_annotation_path = (
+    OUTPUT_ROOT
+    / "processed_annotations_demo_v6.csv"
+)
+
+processed_annotations_df.to_csv(
+    processed_annotation_path,
+    index=False
+)
+
+
+doctor_color_mapping_df = (
+    processed_annotations_df[
+        [
+            "image_id",
+            "rad_id",
+            "doctor_color_name",
+            "doctor_color_rgb"
+        ]
+    ]
+    .drop_duplicates()
+    .sort_values(
+        [
+            "image_id",
+            "rad_id"
+        ]
+    )
+)
+
+doctor_color_mapping_path = (
+    OUTPUT_ROOT
+    / "doctor_color_mapping_demo_v6.csv"
+)
+
+doctor_color_mapping_df.to_csv(
+    doctor_color_mapping_path,
+    index=False
+)
+
+
+
+
+verification_df = pd.DataFrame(
+    verification_records
+)
+
+verification_report_path = (
+    OUTPUT_ROOT
+    / "annotation_verification_demo_v6.csv"
+)
+
+verification_df.to_csv(
+    verification_report_path,
+    index=False
+)
+
+elapsed_time = (
+    perf_counter()
+    - start_time
+)
+
+success_count = len(
+    manifest_records
+)
+
+print()
+print(
+    "Successful images:",
+    success_count
+)
+
+print(
+    "Failed images:",
+    len(failed_records)
+)
+
+print(
+    "Elapsed time:",
+    round(
+        elapsed_time,
+        2
+    ),
+    "seconds"
+)
+
+if elapsed_time > 0:
+    print(
+        "Processing speed:",
+        round(
+            success_count
+            / elapsed_time,
+            3
+        ),
+        "images/second"
+    )
+
+print(
+    "Manifest:",
+    manifest_path
+)
+
+print(
+    "Processed annotations:",
+    processed_annotation_path
+)
+
+print(
+    "Doctor-color mapping:",
+    doctor_color_mapping_path
+)
+
+print(
+    "Annotation verification report:",
+    verification_report_path
+)
+
+print(
+    "Failed records:",
+    failed_path
+)
+
+if SAVE_ANNOTATED:
+    print(
+        "Annotated images:",
+        ANNOTATED_DIR
+    )
+
+if SAVE_VERIFICATION_ORIGINAL:
+    print(
+        "Original-coordinate verification images:",
+        VERIFICATION_DIR
+    )
+
+if DEVICE.type == "cuda":
+    print(
+        "Maximum allocated GPU memory:",
+        round(
+            torch.cuda.max_memory_allocated()
+            / 1024 ** 3,
+            3
+        ),
+        "GB"
+    )
+
+print()
+print(
+    "Preprocessing Demo V6 completed."
+)
