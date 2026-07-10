@@ -1,0 +1,656 @@
+# Ⅰ. 确认数据集主路径
+
+# 从 pathlib 工具箱导入路径工具 Path
+from pathlib import Path
+
+# DATA_ROOT 是数据集主路径
+# Path(...) 的作用是：把长得像路径的一长串字符串变成路径对象
+# 并把它命名为 DATA_ROOT
+DATA_ROOT = Path("/kaggle/input/competitions/vinbigdata-chest-xray-abnormalities-detection")
+
+# 打印数据集路径，确认当前使用的是哪个数据集文件夹
+print("数据集路径：", DATA_ROOT)
+
+# DATA_ROOT.exists() 用来检查这个路径是否真的存在
+print("这个路径是否存在：", DATA_ROOT.exists())
+
+# \n 是换行符，用来让输出更清楚
+print("\n数据集里面有这些东西：")
+
+# DATA_ROOT.iterdir() = 查看 DATA_ROOT 文件夹第一层内容
+# for item in ... 表示把文件夹里的内容一个一个取出来
+for item in DATA_ROOT.iterdir():
+    # 打印每一个第一层文件或文件夹
+    print(item)
+
+
+# Ⅱ. 找到训练图像文件夹
+
+# 在 DATA_ROOT 数据集总文件夹下面，找到 train 这个子文件夹
+# 并把它保存为 TRAIN_DIR
+# 这里的 / 不是除法，而是 Path 里的路径拼接
+TRAIN_DIR = DATA_ROOT / "train"
+
+# 打印训练图像文件夹路径
+print("\n训练图像文件夹：", TRAIN_DIR)
+
+# 检查 train 文件夹是否真的存在
+print("这个文件夹是否存在：", TRAIN_DIR.exists())
+
+
+# Ⅲ. 找出所有 DICOM 图像
+
+# TRAIN_DIR.glob("*.dicom") 用来在 train 文件夹里查找所有 .dicom 文件
+# *.dicom 的意思是：任意文件名 + .dicom 后缀
+# glob 找到的是“可以逐个取出的对象”
+# list(...) 把它整理成真正的 Python 列表
+# dicom_files 里面保存所有训练 DICOM 图像路径
+dicom_files = list(TRAIN_DIR.glob("*.dicom"))
+
+# len(dicom_files) 用来计算 dicom_files 这个列表里有多少个元素
+# 这里就是统计找到了多少张 DICOM 图像
+print("\n找到训练 DICOM 数量：", len(dicom_files))
+
+# 打印前 5 张 DICOM 的路径，方便检查是否真的找到了图像文件
+print("前 5 张 DICOM：")
+
+# dicom_files[:5] 表示从 dicom_files 列表里取前 5 个元素
+# for path in ... 表示把前 5 个路径一个一个取出来
+for path in dicom_files[:5]:
+    # 打印当前这一个 DICOM 路径
+    print(path)
+
+
+# Ⅳ. 读取第一张 DICOM
+
+# pydicom 是专门用来读取 DICOM 医学影像文件的工具包
+import pydicom
+
+# numpy 是 Python 里处理矩阵、数组、图像像素值最常用的工具
+# as np 表示以后把 numpy 简写成 np
+import numpy as np
+
+# dicom_files[0] 表示取 dicom_files 列表里的第一个元素
+# 也就是第一张 DICOM 图像的路径
+first_dicom_path = dicom_files[0]
+
+# 打印提示文字
+print("\n准备读取这一张：")
+
+# 打印准备读取的 DICOM 文件路径
+print(first_dicom_path)
+
+# 使用 pydicom 读取 first_dicom_path 这张 DICOM 文件
+# 读取到的完整 DICOM 数据对象保存为 ds
+# ds 里面既有图像像素数据，也有 DICOM 元数据
+ds = pydicom.dcmread(first_dicom_path)
+
+# 从 ds 这个 DICOM 对象中提取图像像素数组
+# 也就是把 DICOM 文件里的图像部分拿出来，变成一个矩阵
+# 并存到 pixel_array 这个变量里
+pixel_array = ds.pixel_array
+
+# 如果程序运行到这里，说明 DICOM 文件读取成功，pixel_array 也提取成功
+print("\n读取成功")
+
+# type(pixel_array) 用来查看 pixel_array 的数据类型
+# 正常情况下应该是 numpy.ndarray
+print("pixel_array 类型：", type(pixel_array))
+
+# pixel_array.shape 用来查看图像矩阵的形状
+# 对灰度图来说，一般是 height, width
+# 例如 (3000, 3000) 表示高 3000 像素，宽 3000 像素
+print("pixel_array 形状：", pixel_array.shape)
+
+# pixel_array.dtype 用来查看像素值的数据类型
+# 医学 DICOM 图像常见是 uint16
+print("pixel_array 数据类型：", pixel_array.dtype)
+
+# np.min(pixel_array) 用来查看整张图像里的最小像素值
+print("最小像素值：", np.min(pixel_array))
+
+# np.max(pixel_array) 用来查看整张图像里的最大像素值
+print("最大像素值：", np.max(pixel_array))
+
+
+# Ⅴ. 显示图像
+
+# matplotlib 是 Python 里常用的画图工具
+# matplotlib.pyplot 是 matplotlib 里的绘图接口
+# as plt 表示以后把 matplotlib.pyplot 简写成 plt
+import matplotlib.pyplot as plt
+
+# 创建一个显示画布
+# figsize=(6, 6) 表示画布宽 6，高 6
+# 注意这里是显示画布大小，不是图像真实像素大小
+plt.figure(figsize=(6, 6))
+
+# imshow = image show，用来把图像矩阵显示成图片
+# pixel_array 是前面从 DICOM 中提取出来的图像矩阵
+# cmap="gray" 表示用灰度颜色表显示图片
+plt.imshow(pixel_array, cmap="gray")
+
+# 关闭坐标轴，因为我们现在只是查看胸片，不需要 x/y 坐标
+plt.axis("off")
+
+# 给显示出来的图片加标题
+plt.title("Raw DICOM pixel_array")
+
+# 真正把图片显示出来
+plt.show()
+
+#Ⅵ.记录图像元数据
+# 元数据包括 image ID, width, height, photometric interpretation, and pixel-value range
+
+# first_dicom_path.stem 的意思是只要文件名，不要 .dicom 后缀
+# 例如 xxx.dicom -> xxx
+image_id = first_dicom_path.stem
+
+# pixel_array.shape 表示图像矩阵的形状
+# 对灰度图来说，顺序是 height, width
+height, width = pixel_array.shape
+
+# PhotometricInterpretation 是 DICOM 里的光度解释方式
+# 常见值包括 MONOCHROME1 和 MONOCHROME2
+photometric_interpretation = ds.PhotometricInterpretation
+
+# np.min(pixel_array) 用来获取图像中的最小像素值
+pixel_min = np.min(pixel_array)
+
+# np.max(pixel_array) 用来获取图像中的最大像素值
+pixel_max = np.max(pixel_array)
+
+# 打印 image ID
+print("image_id:", image_id)
+
+# 打印图像宽度
+print("width:", width)
+
+# 打印图像高度
+print("height:", height)
+
+# 打印光度解释方式
+print("PhotometricInterpretation:", photometric_interpretation)
+
+# 打印最小像素值
+print("pixel_min:", pixel_min)
+
+# 打印最大像素值
+print("pixel_max:", pixel_max)
+
+
+# Ⅶ.批量记录前 20 张 DICOM 图像的元数据
+
+# pandas 是 Python 里专门处理表格数据的工具
+# 我们最后要把每张图的元数据整理成表格，所以要用 pandas
+import pandas as pd
+
+# tqdm 是进度条工具
+# 它可以显示当前处理到第几张图
+from tqdm import tqdm
+
+# 找出 train 文件夹下所有 .dicom 文件
+# TRAIN_DIR.glob("*.dicom") 表示查找所有以 .dicom 结尾的文件
+# list(...) 把找到的结果变成列表
+dicom_files = list(TRAIN_DIR.glob("*.dicom"))
+
+# 创建一个空列表，用来保存每张图像的元数据
+metadata_records = []
+
+# 先从全部 DICOM 图像中取前 20 张进行测试
+sample_dicom_files = dicom_files[:20]
+
+# 对前 20 张 DICOM 图像逐张处理
+# tqdm(...) 只是给循环加进度条，不改变核心逻辑
+for dicom_path in tqdm(sample_dicom_files):
+
+    # 使用 pydicom 读取当前这张 DICOM 文件
+    ds = pydicom.dcmread(dicom_path)
+
+    # 从 DICOM 文件中提取图像像素矩阵
+    pixel_array = ds.pixel_array
+
+    # dicom_path.stem 表示只取文件名，不要 .dicom 后缀
+    image_id = dicom_path.stem
+
+    # pixel_array.shape 表示图像矩阵的形状
+    # 对灰度图来说，顺序是 height, width
+    height, width = pixel_array.shape
+
+    # 从 DICOM 元数据中提取光度解释方式
+    photometric_interpretation = ds.PhotometricInterpretation
+
+    # 获取当前图像的最小像素值
+    pixel_min = np.min(pixel_array)
+
+    # 获取当前图像的最大像素值
+    pixel_max = np.max(pixel_array)
+
+    # metadata_records.append(...) 的意思是：
+    # 把当前这张图像的元数据作为一条记录加入 metadata_records 列表
+    metadata_records.append({
+        "image_id": image_id,
+        "split": "train",
+        "width": width,
+        "height": height,
+        "PhotometricInterpretation": photometric_interpretation,
+        "pixel_min": pixel_min,
+        "pixel_max": pixel_max
+    })
+
+# pd.DataFrame(metadata_records) 用 pandas 把记录列表转换成表格
+metadata_df = pd.DataFrame(metadata_records)
+
+# 在 Kaggle Notebook / Jupyter Notebook 里
+# 如果一个变量单独放在最后一行，它会自动显示出来
+metadata_df
+
+#Ⅷ.获取全部元数据并整理成表格
+import pandas as pd
+# pandas 是 Python 里专门处理表格数据的工具。
+# 我们最后要把每张图的元数据整理成表格，所以要用 pandas。
+
+from tqdm import tqdm
+# tqdm 是进度条工具。
+
+dicom_files = list(TRAIN_DIR.glob("*.dicom"))
+# 找出 TRAIN_DIR 文件夹下所有以 .dicom 结尾的文件。
+# list(...) 把找到的文件路径转换成列表。
+
+metadata_records = []
+# 创建一个空列表，用来保存每张图像的元数据记录。
+
+sample_dicom_files = dicom_files[:20]
+# 从全部 DICOM 文件中取前 20 张进行测试。
+
+for dicom_path in tqdm(sample_dicom_files):
+    # tqdm(...) 只是给循环加进度条，不改变核心处理逻辑。
+    # dicom_path 表示当前正在处理的 DICOM 文件路径。
+
+    ds = pydicom.dcmread(dicom_path)
+    # 读取当前 DICOM 文件，得到完整的 DICOM 对象。
+
+    pixel_array = ds.pixel_array
+    # 从 DICOM 对象中提取图像像素矩阵。
+
+    image_id = dicom_path.stem
+    # 只获取文件名，不包括 .dicom 后缀。
+
+    height, width = pixel_array.shape
+    # 获取图像的高度和宽度。
+    # pixel_array.shape 的顺序是 height, width。
+
+    photometric_interpretation = ds.PhotometricInterpretation
+    # 获取图像的光度解释方式，例如 MONOCHROME1 或 MONOCHROME2。
+
+    pixel_min = np.min(pixel_array)
+    # 获取当前图像的最小像素值。
+
+    pixel_max = np.max(pixel_array)
+    # 获取当前图像的最大像素值。
+
+    metadata_records.append({
+        "image_id": image_id,
+        "split": "train",
+        "width": width,
+        "height": height,
+        "PhotometricInterpretation": photometric_interpretation,
+        "pixel_min": pixel_min,
+        "pixel_max": pixel_max
+    })
+    # append 的意思是把当前这张图像的元数据记录
+    # 添加到 metadata_records 列表的末尾。
+
+metadata_df = pd.DataFrame(metadata_records)
+# pd.DataFrame(metadata_records) 使用 pandas
+# 把元数据记录列表转换成表格。
+
+metadata_df
+# 这一行没有使用 print()。
+# 但在 Kaggle Notebook 或 Jupyter Notebook 中，
+# 如果一个变量单独放在代码格最后一行，它会自动显示出来。
+
+#Ⅸ.强度反转一张
+from pathlib import Path
+
+import pydicom
+
+import pandas as pd
+# pandas 是 Python 里专门处理表格数据的工具。
+# 我们最后要把每张图的元数据整理成表格，所以要用 pandas。
+
+import matplotlib.pyplot as plt
+# matplotlib.pyplot 用来打开绘图接口，并显示图像。
+
+
+DATA_ROOT = Path(
+    "/kaggle/input/competitions/"
+    "vinbigdata-chest-xray-abnormalities-detection"
+)
+# DATA_ROOT 表示 VinBigData 数据集的主路径。
+
+
+metadata_df = pd.read_csv(
+    "/kaggle/working/dicom_metadata_all.csv"
+)
+# 读取之前生成的全部 DICOM 元数据 CSV。
+# 读取后的表格保存到 metadata_df。
+
+
+mono1_row = metadata_df[
+    metadata_df["PhotometricInterpretation"] == "MONOCHROME1"
+].iloc[0]
+# 在 metadata_df 表格里筛选出
+# PhotometricInterpretation 等于 MONOCHROME1 的行。
+# .iloc[0] 表示取筛选结果中的第一行。
+
+
+image_id = mono1_row["image_id"]
+# 从这一行记录中取出 image_id。
+
+
+split = mono1_row["split"]
+# 从这一行记录中取出 split。
+# split 表示图像属于 train 还是 test。
+
+
+dicom_path = DATA_ROOT / split / f"{image_id}.dicom"
+# 使用 DATA_ROOT、split 和 image_id 拼出完整的 DICOM 文件路径。
+# 例如：
+# 数据集主路径 / train / image_id.dicom
+
+
+ds = pydicom.dcmread(dicom_path)
+# 使用 pydicom 读取这张 DICOM 文件。
+# 读取后的完整 DICOM 对象保存到 ds。
+
+
+pixel_array = ds.pixel_array
+# 从 DICOM 对象中提取图像像素矩阵。
+
+
+if ds.PhotometricInterpretation == "MONOCHROME1":
+    # 判断这张图像的光度解释方式是否为 MONOCHROME1。
+
+    processed_pixel_array = (
+        pixel_array.max()
+        + pixel_array.min()
+        - pixel_array
+    )
+    # 如果是 MONOCHROME1，就进行强度反转。
+
+else:
+    processed_pixel_array = pixel_array
+    # 如果不是 MONOCHROME1，就不进行反转，保持原图。
+
+
+print("image_id:", image_id)
+# 打印图像 ID。
+
+print("split:", split)
+# 打印图像属于 train 还是 test。
+
+print(
+    "PhotometricInterpretation:",
+    ds.PhotometricInterpretation
+)
+# 打印图像的光度解释方式。
+
+print("original min:", pixel_array.min())
+# 打印原始图像的最小像素值。
+
+print("original max:", pixel_array.max())
+# 打印原始图像的最大像素值。
+
+print("processed min:", processed_pixel_array.min())
+# 打印处理后图像的最小像素值。
+
+print("processed max:", processed_pixel_array.max())
+# 打印处理后图像的最大像素值。
+
+
+plt.figure(figsize=(6, 6))
+# 创建一个宽 6、高 6 的绘图画布。
+
+plt.imshow(pixel_array, cmap="gray")
+# 使用灰度模式显示原始图像。
+
+plt.axis("off")
+# 关闭图像坐标轴。
+
+plt.title("Original Image")
+# 设置原始图像的标题。
+
+plt.show()
+# 显示原始图像。
+
+
+plt.figure(figsize=(6, 6))
+# 创建另一个宽 6、高 6 的绘图画布。
+
+plt.imshow(processed_pixel_array, cmap="gray")
+# 使用灰度模式显示处理后的图像。
+
+plt.axis("off")
+# 关闭图像坐标轴。
+
+plt.title("After MONOCHROME1 Handling")
+# 设置处理后图像的标题。
+
+plt.show()
+# 显示处理后的图像。
+
+Ⅹ.处理全部图像，整体反转
+# 遍历 train 和 test 的全部 DICOM。
+# 每张都判断是否为 MONOCHROME1。
+# 只有 MONOCHROME1 才进行强度反转。
+# 已经保存过的文件自动跳过。
+# 不显示每张图片。
+# 持续处理到全部结束。
+
+
+from pathlib import Path
+# 从 pathlib 模块中导入 Path。
+# Path 用来处理文件夹路径和文件路径。
+
+
+import pydicom
+# pydicom 用来读取 DICOM 医学影像文件。
+
+
+import numpy as np
+# numpy 用来处理图像像素矩阵和数值类型。
+
+
+from PIL import Image
+# 从 PIL 中导入 Image。
+# Image 用来把处理后的像素矩阵保存成 PNG 图片。
+
+
+from tqdm import tqdm
+# tqdm 用来显示批量处理时的进度条。
+
+
+DATA_ROOT = Path(
+    "/kaggle/input/competitions/"
+    "vinbigdata-chest-xray-abnormalities-detection"
+)
+# DATA_ROOT 是原始 VinBigData 数据集的主路径。
+
+
+OUTPUT_ROOT = Path("/kaggle/working/monochrome1_processed")
+# OUTPUT_ROOT 是处理后图片的总保存文件夹。
+# 程序会在这个文件夹中继续建立 train 和 test 子文件夹。
+
+
+processed_count = 0
+# 记录本次新处理并保存的 MONOCHROME1 图像数量。
+
+
+skipped_count = 0
+# 记录因为输出文件已经存在而被跳过的图像数量。
+
+
+mono2_count = 0
+# 记录不是 MONOCHROME1，因此不需要反转的图像数量。
+
+
+error_count = 0
+# 记录处理失败的图像数量。
+
+
+for split in ["train", "test"]:
+    # 依次处理 train 和 test 两个文件夹。
+    # 第一轮 split 是 "train"。
+    # 第二轮 split 是 "test"。
+
+    input_dir = DATA_ROOT / split
+    # 拼出当前输入文件夹路径。
+    # 例如 DATA_ROOT / "train"。
+
+    output_dir = OUTPUT_ROOT / split
+    # 拼出当前输出文件夹路径。
+    # 例如 OUTPUT_ROOT / "train"。
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # 创建当前输出文件夹。
+    # parents=True 表示如果上级文件夹不存在，也一起创建。
+    # exist_ok=True 表示文件夹已经存在时不报错。
+
+    dicom_files = list(input_dir.glob("*.dicom"))
+    # 找出当前输入文件夹下所有以 .dicom 结尾的文件。
+    # list(...) 把找到的路径转换成列表。
+
+    for dicom_path in tqdm(
+        dicom_files,
+        desc=f"Processing {split}"
+    ):
+        # 逐张遍历当前文件夹中的全部 DICOM 图像。
+        # dicom_path 表示当前正在处理的 DICOM 文件路径。
+        # tqdm 显示当前处理进度。
+
+        try:
+            # try 表示尝试执行下面的处理代码。
+            # 如果某一张图像发生错误，程序不会整体停止，
+            # 而是进入下面的 except，记录错误后继续处理下一张。
+
+            ds = pydicom.dcmread(dicom_path)
+            # 使用 pydicom 读取当前 DICOM 文件。
+            # 完整的 DICOM 对象保存到 ds。
+
+            if ds.PhotometricInterpretation != "MONOCHROME1":
+                # 判断当前图像是否不是 MONOCHROME1。
+                # != 表示“不等于”。
+
+                mono2_count += 1
+                # 如果不是 MONOCHROME1，
+                # 就把不需要反转的数量加 1。
+
+                continue
+                # 跳过当前这张图，
+                # 直接开始处理下一张 DICOM。
+
+            image_id = dicom_path.stem
+            # 获取当前图像的文件名，
+            # 但不包含 .dicom 后缀。
+
+            output_path = (
+                output_dir
+                / f"{image_id}_processed.png"
+            )
+            # 拼出处理后 PNG 图片的保存路径。
+            # 例如：
+            # /kaggle/working/monochrome1_processed/train/
+            # 图像ID_processed.png
+
+            if output_path.exists():
+                # 检查这个输出文件是否已经存在。
+
+                skipped_count += 1
+                # 如果已经存在，
+                # 就把跳过数量加 1。
+
+                continue
+                # 跳过当前这张图，
+                # 不重复处理，也不覆盖已有文件。
+
+            pixel_array = ds.pixel_array.astype(np.int32)
+            # 从 DICOM 对象中提取图像像素矩阵。
+            # astype(np.int32) 把像素数据转换成 int32。
+            # 这样做可以避免反转计算时出现无符号整数问题。
+
+            processed_pixel_array = (
+                pixel_array.max()
+                + pixel_array.min()
+                - pixel_array
+            )
+            # 对 MONOCHROME1 图像进行强度反转。
+            # 原本较大的像素值会变小，
+            # 原本较小的像素值会变大。
+
+            processed_pixel_array = (
+                processed_pixel_array.astype(np.uint16)
+            )
+            # 把处理后的像素矩阵转换回 uint16。
+            # uint16 适合保存原始高位深灰度图像。
+
+            Image.fromarray(
+                processed_pixel_array
+            ).save(output_path)
+            # 把处理后的像素矩阵转换成图片对象。
+            # 然后保存到 output_path 指定的位置。
+
+            processed_count += 1
+            # 当前图像成功处理并保存后，
+            # 把新处理数量加 1。
+
+        except Exception as error:
+            # 如果当前图像处理过程中发生错误，
+            # 程序会进入这里，而不会整体停止。
+
+            error_count += 1
+            # 把处理失败数量加 1。
+
+            print("处理失败：", dicom_path.name)
+            # 打印处理失败的 DICOM 文件名。
+
+            print("错误：", error)
+            # 打印具体错误信息。
+
+
+print("处理完成")
+# 所有 train 和 test 图像遍历结束后，
+# 打印处理完成。
+
+
+print(
+    "新处理的 MONOCHROME1 数量：",
+    processed_count
+)
+# 打印本次新处理并保存的 MONOCHROME1 图像数量。
+
+
+print(
+    "已存在并跳过的数量：",
+    skipped_count
+)
+# 打印因为输出文件已经存在而跳过的数量。
+
+
+print(
+    "不是 MONOCHROME1 的数量：",
+    mono2_count
+)
+# 打印不是 MONOCHROME1、
+# 因此没有进行反转的图像数量。
+
+
+print(
+    "处理失败数量：",
+    error_count
+)
+# 打印处理失败的图像数量。
+
+
+print("保存位置：", OUTPUT_ROOT)
+# 打印所有处理结果的总保存位置。
