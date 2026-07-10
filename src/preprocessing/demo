@@ -1,0 +1,82 @@
+from pathlib import Path
+
+import pydicom
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+
+
+DATA_ROOT = Path(
+    "/kaggle/input/competitions/"
+    "vinbigdata-chest-xray-abnormalities-detection"
+)
+
+TRAIN_DIR = DATA_ROOT / "train"
+OUTPUT_DIR = Path("/kaggle/working/preprocessing_demo")
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+dicom_files = list(TRAIN_DIR.glob("*.dicom"))
+
+target_dicom_path = None
+
+for dicom_path in dicom_files:
+    ds_header = pydicom.dcmread(
+        dicom_path,
+        stop_before_pixels=True
+    )
+
+    if ds_header.PhotometricInterpretation == "MONOCHROME1":
+        target_dicom_path = dicom_path
+        break
+
+if target_dicom_path is None:
+    raise FileNotFoundError("No MONOCHROME1 DICOM image was found.")
+
+ds = pydicom.dcmread(target_dicom_path)
+
+pixel_array = ds.pixel_array
+image_id = target_dicom_path.stem
+height, width = pixel_array.shape
+photometric_interpretation = ds.PhotometricInterpretation
+pixel_min = pixel_array.min()
+pixel_max = pixel_array.max()
+
+if photometric_interpretation == "MONOCHROME1":
+    processed_pixel_array = (
+        pixel_array.astype(np.int32).max()
+        + pixel_array.astype(np.int32).min()
+        - pixel_array.astype(np.int32)
+    )
+else:
+    processed_pixel_array = pixel_array.astype(np.int32)
+
+processed_pixel_array = processed_pixel_array.astype(np.uint16)
+
+output_path = OUTPUT_DIR / f"{image_id}_processed.png"
+
+Image.fromarray(processed_pixel_array).save(output_path)
+
+print("Dataset path:", DATA_ROOT)
+print("Number of training DICOM files:", len(dicom_files))
+print("Image ID:", image_id)
+print("Width:", width)
+print("Height:", height)
+print("Photometric Interpretation:", photometric_interpretation)
+print("Original pixel minimum:", pixel_min)
+print("Original pixel maximum:", pixel_max)
+print("Processed pixel minimum:", processed_pixel_array.min())
+print("Processed pixel maximum:", processed_pixel_array.max())
+print("Saved to:", output_path)
+
+plt.figure(figsize=(6, 6))
+plt.imshow(pixel_array, cmap="gray")
+plt.axis("off")
+plt.title("Original DICOM Image")
+plt.show()
+
+plt.figure(figsize=(6, 6))
+plt.imshow(processed_pixel_array, cmap="gray")
+plt.axis("off")
+plt.title("Image After MONOCHROME1 Handling")
+plt.show()
