@@ -1,0 +1,526 @@
+"""
+VinDr-CXR / VinBigData: YOLO11n single-class Nodule/Mass baseline
+
+Kaggle usage:
+1. Create a Kaggle Notebook and enable a GPU.
+2. Upload/add your VinDr-CXR PNG dataset and annotation CSV.
+3. Paste this file into a code cell, or upload and run with: %run /kaggle/input/.../VinDr_YOLO11n_Baseline_Kaggle.py
+4. Edit only the CONFIG section first.
+
+The script builds a reproducible train/val/test dataset, runs a smoke test,
+trains YOLO11n, evaluates best.pt on the fixed test split, exports ONNX, and
+writes a deployment manifest for Jetson Nano comparison.
+"""
+
+# %% [markdown]
+# # 0. Install and import
+
+# %%
+import importlib.util
+import json
+import os
+import random
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+if importlib.util.find_spec("ultralytics") is None:
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "-q", "ultralytics"
+    ])
+
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from ultralytics import YOLO
+
+
+# %% [markdown]
+# # 1. CONFIG — normally this is the only section you edit
+
+# %%
+SEED = 42
+
+# Change these two paths to match the right-hand /kaggle/input panel.
+ANNOTATION_CSV = Path(
+    "/kaggle/input/vinbigdata-chest-xray-abnormalities-detection/train.csv"
+)
+IMAGE_DIR = Path(
+    "/kaggle/input/vindr-cxr-png/train"
+)
+
+WORK_DIR = Path("/kaggle/working/vindr_yolo_nodule_mass")
+DATASET_DIR = WORK_DIR / "dataset"
+RUNS_DIR = WORK_DIR / "runs"
+
+# VinBigData commonly uses the combined label "Nodule/Mass". The other two
+# aliases make the script compatible with a CSV where they were separated.
+TARGET_LABELS = {"nodule/mass", "nodule", "mass"}
+YOLO_CLASS_NAME = "Nodule_Mass"
+
+# Include all positive images and at most this many negative images per positive.
+# Negatives are images without a target box, including No finding and other findings.
+NEGATIVE_TO_POSITIVE_RATIO = 1.0
+
+TRAIN_FRACTION = 0.70
+VAL_FRACTION = 0.15
+TEST_FRACTION = 0.15
+
+IMAGE_SIZE = 640
+SMOKE_EPOCHS = 1
+FULL_EPOCHS = 100
+BATCH_SIZE = 8
+PATIENCE = 20
+NUM_WORKERS = 2
+DEVICE = 0 if torch.cuda.is_available() else "cpu"
+
+
+# %% [markdown]
+# # 2. Reproducibility and path checks
+
+# %%
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+print("PyTorch:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+
+assert ANNOTATION_CSV.exists(), f"Annotation CSV not found: {ANNOTATION_CSV}"
+assert IMAGE_DIR.exists(), f"Image directory not found: {IMAGE_DIR}"
+assert abs(TRAIN_FRACTION + VAL_FRACTION + TEST_FRACTION - 1.0) < 1e-9
+
+WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# %% [markdown]
+# # 3. Read and validate annotations
+
+# %%
+df = pd.read_csv(ANNOTATION_CSV)
+required_columns = {"image_id", "class_name", "x_min", "y_min", "x_max", "y_max"}
+missing_columns = required_columns - set(df.columns)
+assert not missing_columns, f"CSV is missing columns: {sorted(missing_columns)}"
+
+df["image_id"] = df["image_id"].astype(str)
+df["class_normalized"] = df["class_name"].fillna("").astype(str).str.strip().str.lower()
+df["is_target"] = df["class_normalized"].isin(TARGET_LABELS)
+
+target_df = df.loc[df["is_target"]].copy()
+target_df = target_df.dropna(subset=["x_min", "y_min", "x_max", "y_max"])
+
+print("CSV rows:", len(df))
+print("Unique images in CSV:", df["image_id"].nunique())
+print("Target boxes:", len(target_df))
+print("Target-positive images:", target_df["image_id"].nunique())
+print("Target labels found:", sorted(target_df["class_name"].unique().tolist()))
+assert len(target_df) > 0, (
+    "No Nodule/Mass boxes found. Inspect df['class_name'].value_counts() and "
+    "update TARGET_LABELS."
+)
+
+
+# %% [markdown]
+# # 4. Index images and select positives/negatives
+
+# %%
+SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+image_paths = {
+    p.stem: p
+    for p in IMAGE_DIR.rglob("*")
+    if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+}
+print("Image files found:", len(image_paths))
+assert image_paths, f"No PNG/JPG images found under {IMAGE_DIR}"
+
+csv_image_ids = set(df["image_id"].unique())
+available_ids = sorted(csv_image_ids & set(image_paths))
+missing_file_ids = sorted(csv_image_ids - set(image_paths))
+print("CSV images with a matching file:", len(available_ids))
+print("CSV images without a matching file:", len(missing_file_ids))
+
+positive_ids = sorted(set(target_df["image_id"]) & set(available_ids))
+negative_candidates = sorted(set(available_ids) - set(positive_ids))
+
+rng = np.random.default_rng(SEED)
+max_negatives = min(
+    len(negative_candidates),
+    int(round(len(positive_ids) * NEGATIVE_TO_POSITIVE_RATIO)),
+)
+negative_ids = sorted(
+    rng.choice(negative_candidates, size=max_negatives, replace=False).tolist()
+) if max_negatives else []
+
+selected = pd.DataFrame({
+    "image_id": positive_ids + negative_ids,
+    "has_target": [1] * len(positive_ids) + [0] * len(negative_ids),
+})
+
+print("Selected positive images:", len(positive_ids))
+print("Selected negative images:", len(negative_ids))
+print("Total selected images:", len(selected))
+assert len(positive_ids) >= 3, "At least 3 positive images are required for splitting."
+
+
+# %% [markdown]
+# # 5. Fixed, stratified image-level train/val/test split
+
+# %%
+train_df, temporary_df = train_test_split(
+    selected,
+    test_size=VAL_FRACTION + TEST_FRACTION,
+    random_state=SEED,
+    stratify=selected["has_target"],
+)
+relative_test_fraction = TEST_FRACTION / (VAL_FRACTION + TEST_FRACTION)
+val_df, test_df = train_test_split(
+    temporary_df,
+    test_size=relative_test_fraction,
+    random_state=SEED,
+    stratify=temporary_df["has_target"],
+)
+
+split_frames = {
+    "train": train_df.sort_values("image_id").reset_index(drop=True),
+    "val": val_df.sort_values("image_id").reset_index(drop=True),
+    "test": test_df.sort_values("image_id").reset_index(drop=True),
+}
+
+assert set(train_df.image_id).isdisjoint(val_df.image_id)
+assert set(train_df.image_id).isdisjoint(test_df.image_id)
+assert set(val_df.image_id).isdisjoint(test_df.image_id)
+
+for split_name, split_df in split_frames.items():
+    print(
+        split_name,
+        "images=", len(split_df),
+        "positive=", int(split_df["has_target"].sum()),
+        "negative=", int((split_df["has_target"] == 0).sum()),
+    )
+
+split_manifest = pd.concat(
+    [frame.assign(split=name) for name, frame in split_frames.items()],
+    ignore_index=True,
+)
+split_manifest.to_csv(WORK_DIR / "fixed_split_manifest.csv", index=False)
+
+
+# %% [markdown]
+# # 6. Convert bounding boxes to YOLO labels
+
+# %%
+def image_size(path: Path):
+    with Image.open(path) as image:
+        return image.width, image.height
+
+
+def valid_target_boxes(image_id: str, width: int, height: int):
+    rows = target_df.loc[target_df["image_id"] == image_id]
+    labels = []
+    rejected = 0
+
+    for row in rows.itertuples(index=False):
+        x1 = float(np.clip(row.x_min, 0, width))
+        y1 = float(np.clip(row.y_min, 0, height))
+        x2 = float(np.clip(row.x_max, 0, width))
+        y2 = float(np.clip(row.y_max, 0, height))
+
+        box_width = x2 - x1
+        box_height = y2 - y1
+        if box_width <= 1 or box_height <= 1:
+            rejected += 1
+            continue
+
+        x_center = ((x1 + x2) / 2) / width
+        y_center = ((y1 + y2) / 2) / height
+        normalized_width = box_width / width
+        normalized_height = box_height / height
+        labels.append(
+            f"0 {x_center:.6f} {y_center:.6f} "
+            f"{normalized_width:.6f} {normalized_height:.6f}"
+        )
+
+    return labels, rejected
+
+
+# Rebuilding only this generated folder is intentional and safe.
+if DATASET_DIR.exists():
+    shutil.rmtree(DATASET_DIR)
+
+conversion_records = []
+total_rejected = 0
+
+for split_name, split_df in split_frames.items():
+    images_out = DATASET_DIR / "images" / split_name
+    labels_out = DATASET_DIR / "labels" / split_name
+    images_out.mkdir(parents=True, exist_ok=True)
+    labels_out.mkdir(parents=True, exist_ok=True)
+
+    for row in split_df.itertuples(index=False):
+        source_image = image_paths[row.image_id]
+        destination_image = images_out / source_image.name
+        shutil.copy2(source_image, destination_image)
+
+        width, height = image_size(source_image)
+        label_lines, rejected = valid_target_boxes(row.image_id, width, height)
+        total_rejected += rejected
+
+        # An empty .txt file is the correct YOLO label for a negative image.
+        label_path = labels_out / f"{row.image_id}.txt"
+        label_path.write_text("\n".join(label_lines), encoding="utf-8")
+
+        conversion_records.append({
+            "image_id": row.image_id,
+            "split": split_name,
+            "source_path": str(source_image),
+            "dataset_path": str(destination_image),
+            "width": width,
+            "height": height,
+            "has_target": int(bool(label_lines)),
+            "box_count": len(label_lines),
+        })
+
+conversion_df = pd.DataFrame(conversion_records)
+conversion_df.to_csv(WORK_DIR / "dataset_manifest.csv", index=False)
+print("Rejected invalid boxes:", total_rejected)
+print(conversion_df.groupby("split")[["has_target", "box_count"]].sum())
+
+
+# %% [markdown]
+# # 7. Write data.yaml and verify the generated dataset
+
+# %%
+data_yaml = {
+    "path": str(DATASET_DIR),
+    "train": "images/train",
+    "val": "images/val",
+    "test": "images/test",
+    "names": {0: YOLO_CLASS_NAME},
+}
+DATA_YAML_PATH = WORK_DIR / "data.yaml"
+with DATA_YAML_PATH.open("w", encoding="utf-8") as handle:
+    yaml.safe_dump(data_yaml, handle, sort_keys=False)
+
+for split_name in ("train", "val", "test"):
+    image_count = len(list((DATASET_DIR / "images" / split_name).glob("*")))
+    label_count = len(list((DATASET_DIR / "labels" / split_name).glob("*.txt")))
+    assert image_count == label_count, (
+        f"{split_name}: {image_count} images but {label_count} labels"
+    )
+
+print(DATA_YAML_PATH.read_text(encoding="utf-8"))
+
+
+# %% [markdown]
+# # 8. Smoke test — verifies the pipeline, not model quality
+
+# %%
+smoke_model = YOLO("yolo11n.pt")
+smoke_model.train(
+    data=str(DATA_YAML_PATH),
+    epochs=SMOKE_EPOCHS,
+    imgsz=IMAGE_SIZE,
+    batch=BATCH_SIZE,
+    optimizer="AdamW",
+    lr0=0.001,
+    device=DEVICE,
+    workers=NUM_WORKERS,
+    seed=SEED,
+    deterministic=True,
+    amp=True,
+    plots=True,
+    project=str(RUNS_DIR),
+    name="smoke_test",
+    exist_ok=True,
+)
+
+
+# %% [markdown]
+# # 9. Formal training — rerun this cell independently when tuning settings
+
+# %%
+model = YOLO("yolo11n.pt")
+model.train(
+    data=str(DATA_YAML_PATH),
+    epochs=FULL_EPOCHS,
+    imgsz=IMAGE_SIZE,
+    batch=BATCH_SIZE,
+    optimizer="AdamW",
+    lr0=0.001,
+    weight_decay=0.0005,
+    patience=PATIENCE,
+    device=DEVICE,
+    workers=NUM_WORKERS,
+    seed=SEED,
+    deterministic=True,
+    amp=True,
+    plots=True,
+    save=True,
+    project=str(RUNS_DIR),
+    name="yolo11n_640_adamw",
+    exist_ok=True,
+)
+
+BEST_PT = RUNS_DIR / "yolo11n_640_adamw" / "weights" / "best.pt"
+LAST_PT = RUNS_DIR / "yolo11n_640_adamw" / "weights" / "last.pt"
+assert BEST_PT.exists(), f"Training finished but best.pt was not found at {BEST_PT}"
+print("best.pt:", BEST_PT)
+print("last.pt:", LAST_PT)
+
+
+# %% [markdown]
+# # 10. Evaluate best.pt on the untouched fixed test split
+
+# %%
+best_model = YOLO(str(BEST_PT))
+test_metrics = best_model.val(
+    data=str(DATA_YAML_PATH),
+    split="test",
+    imgsz=IMAGE_SIZE,
+    batch=BATCH_SIZE,
+    conf=0.001,
+    iou=0.6,
+    device=DEVICE,
+    workers=NUM_WORKERS,
+    plots=True,
+    project=str(RUNS_DIR),
+    name="fixed_test_evaluation",
+    exist_ok=True,
+)
+
+metric_summary = {
+    "precision": float(test_metrics.box.mp),
+    "recall": float(test_metrics.box.mr),
+    "mAP50": float(test_metrics.box.map50),
+    "mAP50_95": float(test_metrics.box.map),
+    "image_size": IMAGE_SIZE,
+    "model": "YOLO11n",
+    "class": YOLO_CLASS_NAME,
+    "seed": SEED,
+}
+with (WORK_DIR / "pytorch_test_metrics.json").open("w", encoding="utf-8") as handle:
+    json.dump(metric_summary, handle, indent=2)
+print(json.dumps(metric_summary, indent=2))
+
+
+# %% [markdown]
+# # 11. Save per-image PyTorch predictions for later Nano comparison
+
+# %%
+TEST_IMAGE_DIR = DATASET_DIR / "images" / "test"
+predictions = best_model.predict(
+    source=str(TEST_IMAGE_DIR),
+    imgsz=IMAGE_SIZE,
+    conf=0.001,
+    iou=0.6,
+    device=DEVICE,
+    stream=True,
+    verbose=False,
+)
+
+prediction_rows = []
+for result in predictions:
+    image_id = Path(result.path).stem
+    if result.boxes is None or len(result.boxes) == 0:
+        continue
+    xyxy = result.boxes.xyxy.cpu().numpy()
+    confidences = result.boxes.conf.cpu().numpy()
+    classes = result.boxes.cls.cpu().numpy().astype(int)
+    for box, confidence, class_id in zip(xyxy, confidences, classes):
+        prediction_rows.append({
+            "image_id": image_id,
+            "class_id": int(class_id),
+            "confidence": float(confidence),
+            "x1": float(box[0]),
+            "y1": float(box[1]),
+            "x2": float(box[2]),
+            "y2": float(box[3]),
+            "platform": "Kaggle_PyTorch",
+        })
+
+pd.DataFrame(prediction_rows).to_csv(
+    WORK_DIR / "kaggle_pytorch_test_predictions.csv", index=False
+)
+
+
+# %% [markdown]
+# # 12. Export ONNX for Jetson Nano
+
+# %%
+exported_onnx = best_model.export(
+    format="onnx",
+    imgsz=IMAGE_SIZE,
+    opset=12,
+    simplify=True,
+    dynamic=False,
+    half=False,
+)
+exported_onnx = Path(exported_onnx)
+FINAL_ONNX = WORK_DIR / "best_yolo11n_640.onnx"
+shutil.copy2(exported_onnx, FINAL_ONNX)
+
+deployment_manifest = {
+    "source_weight": str(BEST_PT),
+    "onnx_model": str(FINAL_ONNX),
+    "input_shape": [1, 3, IMAGE_SIZE, IMAGE_SIZE],
+    "class_names": [YOLO_CLASS_NAME],
+    "normalization": "RGB float32 divided by 255.0",
+    "resize": "letterbox",
+    "planned_tensorrt_precision": "FP16",
+    "test_split_manifest": str(WORK_DIR / "fixed_split_manifest.csv"),
+    "pytorch_prediction_csv": str(
+        WORK_DIR / "kaggle_pytorch_test_predictions.csv"
+    ),
+}
+with (WORK_DIR / "deployment_manifest.json").open("w", encoding="utf-8") as handle:
+    json.dump(deployment_manifest, handle, indent=2)
+
+print("ONNX:", FINAL_ONNX)
+print("All deliverables:", WORK_DIR)
+
+
+# %% [markdown]
+# # 13. Optional: create one downloadable ZIP after all cells finish
+
+# %%
+# This archives metrics, manifests, plots, weights, and ONNX. It intentionally
+# excludes the copied dataset images to keep the ZIP manageable.
+DELIVERY_DIR = WORK_DIR / "delivery"
+DELIVERY_DIR.mkdir(parents=True, exist_ok=True)
+
+for source in [
+    BEST_PT,
+    LAST_PT,
+    FINAL_ONNX,
+    DATA_YAML_PATH,
+    WORK_DIR / "fixed_split_manifest.csv",
+    WORK_DIR / "dataset_manifest.csv",
+    WORK_DIR / "pytorch_test_metrics.json",
+    WORK_DIR / "kaggle_pytorch_test_predictions.csv",
+    WORK_DIR / "deployment_manifest.json",
+]:
+    if source.exists():
+        shutil.copy2(source, DELIVERY_DIR / source.name)
+
+for run_name in ["yolo11n_640_adamw", "fixed_test_evaluation"]:
+    run_dir = RUNS_DIR / run_name
+    if run_dir.exists():
+        for pattern in ("*.png", "*.csv", "args.yaml", "results.csv"):
+            for source in run_dir.glob(pattern):
+                destination = DELIVERY_DIR / f"{run_name}_{source.name}"
+                shutil.copy2(source, destination)
+
+archive_path = shutil.make_archive(
+    str(WORK_DIR / "VinDr_YOLO11n_baseline_results"),
+    "zip",
+    root_dir=DELIVERY_DIR,
+)
+print("Download from Kaggle Output:", archive_path)
